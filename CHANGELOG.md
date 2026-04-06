@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+<a name="9.8.1"></a>
+## [9.8.1](https://github.com/pluskal/entity-controller/compare/v9.8.0...v9.8.1) (2026-04-06)
+
+
+### Bug Fixes
+
+* **`grace_period`** – Re-introduced the `grace_period` configuration option to fix spurious `blocked` state transitions caused by cloud/gateway integrations (e.g. Tahoma/Somfy) that do not propagate Home Assistant's service-call context to their state-change events. When EC calls a service on such an integration the delayed state feedback arrives with a fresh, unrelated context; `is_ignored_context()` therefore does not suppress it, `control()` fires, and the controller enters `blocked`. Setting `grace_period` to a value that covers the integration's worst-case round-trip latency suppresses these false positives. The option is disabled by default (`null`) so no existing behaviour is changed.
+
+
 <a name="9.8.0"></a>
 # [9.8.0](https://github.com/pluskal/entity-controller/compare/v9.7.6...v9.8.0) (2026-04-06)
 
@@ -15,7 +24,6 @@ All notable changes to this project will be documented in this file. See [standa
 ### Bug Fixes
 
 * `block_timer_expires` with entities already off no longer leaves the controller stuck in `blocked` state (closes #310).
-* **`grace_period`** – Re-introduced the `grace_period` configuration option to fix spurious `blocked` state transitions caused by cloud/gateway integrations (e.g. Tahoma/Somfy) that do not propagate Home Assistant's service-call context to their state-change events. When EC calls a service on such an integration the delayed state feedback arrives with a fresh, unrelated context; `is_ignored_context()` therefore does not suppress it, `control()` fires, and the controller enters `blocked`. Setting `grace_period` to a value that covers the integration's worst-case round-trip latency suppresses these false positives. The option is disabled by default (`null`) so no existing behaviour is changed.
 
 ### Tests
 
