@@ -605,7 +605,7 @@ class TestStatePersistence:
         m = Model.__new__(Model)
         m.log = logging.getLogger("test")
         m._store = None
-        result = asyncio.get_event_loop().run_until_complete(m._async_restore_state())
+        result = asyncio.run(m._async_restore_state())
         assert result is False
 
     def test_async_restore_false_when_no_data(self):
@@ -615,7 +615,7 @@ class TestStatePersistence:
         store = AsyncMock()
         store.async_load = AsyncMock(return_value=None)
         m._store = store
-        result = asyncio.get_event_loop().run_until_complete(m._async_restore_state())
+        result = asyncio.run(m._async_restore_state())
         assert result is False
 
     def test_async_restore_overridden_when_still_active(self):
@@ -629,7 +629,7 @@ class TestStatePersistence:
         store = AsyncMock()
         store.async_load = AsyncMock(return_value={"state": "overridden", "saved_at": "x"})
         m._store = store
-        result = asyncio.get_event_loop().run_until_complete(m._async_restore_state())
+        result = asyncio.run(m._async_restore_state())
         assert result is True
         m.override.assert_called_once()
 
@@ -643,7 +643,7 @@ class TestStatePersistence:
         store = AsyncMock()
         store.async_load = AsyncMock(return_value={"state": "overridden", "saved_at": "x"})
         m._store = store
-        result = asyncio.get_event_loop().run_until_complete(m._async_restore_state())
+        result = asyncio.run(m._async_restore_state())
         assert result is False
         m.override.assert_not_called()
 
@@ -654,7 +654,7 @@ class TestStatePersistence:
         store = AsyncMock()
         store.async_load = AsyncMock(return_value={"state": "idle", "saved_at": "x"})
         m._store = store
-        result = asyncio.get_event_loop().run_until_complete(m._async_restore_state())
+        result = asyncio.run(m._async_restore_state())
         assert result is False
 
     def test_on_enter_overridden_schedules_save(self):
