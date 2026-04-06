@@ -253,6 +253,7 @@ def _build_model(hass=None, entity=None, config=None):
         m._store = None
         m.disable_block = False
         m.block_timeout = None
+        m.grace_period = None
         m.ignore_state_changes_until = datetime.now()
         m.homeassistant_turn_on_domains = ["group"]
 
