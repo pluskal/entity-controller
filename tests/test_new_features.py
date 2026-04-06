@@ -673,3 +673,191 @@ class TestStatePersistence:
         model.sensor_on()
         assert model.state == "blocked"
         model.hass.async_create_task.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# grace_period — suppress state-entity feedback from slow cloud integrations
+# ---------------------------------------------------------------------------
+
+class TestGracePeriod:
+    """Tests for the grace_period configuration option.
+
+    grace_period is a fallback for integrations (e.g. Tahoma/Somfy) that do not
+    propagate the original HA context to their state-change events, causing EC to
+    enter the blocked state on its own delayed state feedback.
+    """
+
+    # ------------------------------------------------------------------
+    # is_within_grace_period() unit tests
+    # ------------------------------------------------------------------
+
+    def test_is_within_grace_period_disabled_when_none(self):
+        """is_within_grace_period() must return False when grace_period is None."""
+        model = _build_model()
+        assert model.grace_period is None
+        assert model.is_within_grace_period() is False
+
+    def test_is_within_grace_period_true_during_window(self):
+        """is_within_grace_period() returns True while the window is active."""
+        from datetime import timedelta
+        model = _build_model()
+        model.grace_period = 30
+        # Set ignore_state_changes_until well into the future
+        model.ignore_state_changes_until = datetime.now() + timedelta(seconds=30)
+        assert model.is_within_grace_period() is True
+
+    def test_is_within_grace_period_false_after_window(self):
+        """is_within_grace_period() returns False once the deadline has passed."""
+        from datetime import timedelta
+        model = _build_model()
+        model.grace_period = 30
+        # Set ignore_state_changes_until to a time in the past
+        model.ignore_state_changes_until = datetime.now() - timedelta(seconds=1)
+        assert model.is_within_grace_period() is False
+
+    # ------------------------------------------------------------------
+    # call_service() – sets ignore_state_changes_until
+    # ------------------------------------------------------------------
+
+    def test_call_service_sets_deadline_when_grace_period_configured(self):
+        """call_service() updates ignore_state_changes_until when grace_period is set."""
+        from datetime import timedelta
+        model = _build_model()
+        model.grace_period = 5
+        before = datetime.now()
+        model.call_service("light.test", "turn_on")
+        after = datetime.now()
+        # ignore_state_changes_until must be between before+5s and after+5s
+        assert model.ignore_state_changes_until >= before + timedelta(seconds=5)
+        assert model.ignore_state_changes_until <= after + timedelta(seconds=5)
+
+    def test_call_service_does_not_set_deadline_when_grace_period_none(self):
+        """call_service() must NOT update ignore_state_changes_until when grace_period is None."""
+        model = _build_model()
+        model.grace_period = None
+        original = model.ignore_state_changes_until
+        model.call_service("light.test", "turn_on")
+        # The timestamp must be unchanged
+        assert model.ignore_state_changes_until == original
+
+    # ------------------------------------------------------------------
+    # state_entity_state_change() – events dropped inside the window
+    # ------------------------------------------------------------------
+
+    def _make_state_change_event(self, entity_id="light.test", old_state="off", new_state="on"):
+        """Build a minimal HA state-change event mock."""
+        ev = MagicMock()
+        ev.data = {
+            "entity_id": entity_id,
+            "old_state": MagicMock(state=old_state, attributes={}),
+            "new_state": MagicMock(
+                state=new_state,
+                attributes={},
+                context=MagicMock(id="unrelated-ctx"),
+            ),
+        }
+        return ev
+
+    def test_state_entity_state_change_ignored_within_grace_period(self):
+        """state_entity_state_change must be a no-op while within the grace period.
+
+        Put the model in active_timer so state_entity_state_change would normally
+        call control() and transition to blocked.  With grace_period active the
+        event must be silently dropped and the state must remain active_timer.
+        """
+        from datetime import timedelta
+        model = _build_model()
+        # Reach active_timer via sensor_on (entities off, no block)
+        model.is_state_entities_off = MagicMock(return_value=True)
+        model.is_state_entities_on = MagicMock(return_value=False)
+        model.will_stay_on = MagicMock(return_value=False)
+        model.sensor_on()
+        assert model.state == "active_timer"
+
+        model.grace_period = 30
+        model.ignore_state_changes_until = datetime.now() + timedelta(seconds=30)
+        model.is_ignored_context = MagicMock(return_value=False)
+        # State entity turns ON (own delayed feedback that would normally trigger blocked)
+        model.is_state_entities_on = MagicMock(return_value=True)
+        model.is_state_entities_off = MagicMock(return_value=False)
+        model.is_block_enabled = MagicMock(return_value=True)
+
+        ev = self._make_state_change_event(old_state="off", new_state="on")
+        model.state_entity_state_change(ev)
+
+        # Grace period must have suppressed the transition
+        assert model.state == "active_timer", (
+            f"Expected active_timer (grace period suppressed), got {model.state}"
+        )
+
+    def test_state_entity_state_change_processed_after_grace_period(self):
+        """state_entity_state_change must proceed normally after the grace period expires.
+
+        Same scenario as above but with an expired deadline – EC must transition
+        to blocked because an external device turned on the state entity.
+        """
+        from datetime import timedelta
+        model = _build_model()
+        # Reach active_timer
+        model.is_state_entities_off = MagicMock(return_value=True)
+        model.is_state_entities_on = MagicMock(return_value=False)
+        model.will_stay_on = MagicMock(return_value=False)
+        model.sensor_on()
+        assert model.state == "active_timer"
+
+        model.grace_period = 30
+        # Grace period expired 1 second ago
+        model.ignore_state_changes_until = datetime.now() - timedelta(seconds=1)
+        model.is_ignored_context = MagicMock(return_value=False)
+        model.is_state_entities_on = MagicMock(return_value=True)
+        model.is_state_entities_off = MagicMock(return_value=False)
+        model.is_block_enabled = MagicMock(return_value=True)
+
+        ev = self._make_state_change_event(old_state="off", new_state="on")
+        model.state_entity_state_change(ev)
+
+        # EC must have reacted – blocked because state entity is on and block enabled
+        assert model.state == "blocked", (
+            f"Expected blocked after grace period expired, got {model.state}"
+        )
+
+    # ------------------------------------------------------------------
+    # Integration scenario: cloud gateway produces delayed feedback
+    # ------------------------------------------------------------------
+
+    def test_grace_period_prevents_blocked_on_own_delayed_feedback(self):
+        """Cloud integrations (e.g. Tahoma) deliver state feedback with a fresh,
+        unrelated context.  With grace_period set, EC must not enter blocked when
+        it sees its own delayed on-state feedback after calling turn_on.
+
+        Sequence:
+          1. sensor fires → EC activates (active_timer)
+          2. EC calls turn_on → grace_period window armed
+          3. Cloud integration delivers delayed state feedback (fresh context)
+          4. EC must stay in active_timer, NOT transition to blocked
+        """
+        from datetime import timedelta
+        model = _build_model()
+        # Step 1: Reach active_timer
+        model.is_state_entities_off = MagicMock(return_value=True)
+        model.is_state_entities_on = MagicMock(return_value=False)
+        model.will_stay_on = MagicMock(return_value=False)
+        model.sensor_on()
+        assert model.state == "active_timer"
+
+        # Step 2: Arm the grace-period window (simulates what call_service does)
+        model.grace_period = 5
+        model.ignore_state_changes_until = datetime.now() + timedelta(seconds=5)
+
+        # Step 3: Delayed state feedback arrives with fresh, unrelated context
+        model.is_ignored_context = MagicMock(return_value=False)
+        model.is_state_entities_on = MagicMock(return_value=True)
+        model.is_state_entities_off = MagicMock(return_value=False)
+        model.is_block_enabled = MagicMock(return_value=True)
+        ev = self._make_state_change_event(old_state="off", new_state="on")
+        model.state_entity_state_change(ev)
+
+        # Step 4: Grace period must have suppressed the blocked transition
+        assert model.state == "active_timer", (
+            f"Expected active_timer (grace period suppressed), got {model.state}"
+        )
