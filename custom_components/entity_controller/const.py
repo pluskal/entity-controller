@@ -28,6 +28,17 @@ SERVICE_ENABLE_STAY_MODE = "enable_stay_mode"
 SERVICE_DISABLE_STAY_MODE = "disable_stay_mode"
 SERVICE_SET_NIGHT_MODE = "set_night_mode"
 
+# Forced sensors (bypass blocked/constrained/overridden states)
+CONF_FORCED_SENSORS = "forced_sensors"
+
+# Event bus sensor support
+CONF_EVENT_SENSORS = "event_sensors"
+CONF_EVENT_SENSOR_TYPE = "ha_event"  # sensor_type value for HA bus events
+
+# State persistence
+STORAGE_VERSION = 1
+STORAGE_KEY_PREFIX = "entity_controller_state_"
+
 #configuration
 CONF_START_TIME = 'start_time'
 CONF_END_TIME = 'end_time'
