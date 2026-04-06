@@ -119,7 +119,7 @@ from .entity_services import (
 
 
 
-VERSION = '9.7.6'
+VERSION = '9.8.0'
 
 
 _LOGGER = logging.getLogger(__name__)

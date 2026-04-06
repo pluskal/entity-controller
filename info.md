@@ -24,11 +24,19 @@ entity_controller:
     delay: 300                                # optional, overwrites default delay of 180s
 ```
 
+## What's new in v9.8.0
+
+- **`forced_sensors`** – Sensors that bypass `blocked`, `constrained`, and `overridden` states and immediately activate the controller. Ideal for panic buttons or priority scenes.
+- **`event_sensors`** – Subscribe to arbitrary HA bus events as activation triggers (e.g. `zwave_js.value_updated`).
+- **State persistence** – The `overridden` and `blocked` states survive HA restarts using the HA storage layer.
+- **Block-timer fix** – The controller no longer gets stuck in `blocked` when the block timer expires and all state entities are already off (issue #310).
+
 ## Support
 Maintaining and improving this integration is very time consuming because of the sheer number of supported use cases. If you use this component in your home please consider donating or checking the issue tracker to help with the implementation of new features.
 
 [Buy me a coffee](https://gofund.me/7a2487d5)
 
 There are other ways to support development as well: [Ways to support EC](https://danielbkr.net/ways-to-support/)
+
 
 
