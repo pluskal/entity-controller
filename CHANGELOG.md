@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+<a name="9.8.0"></a>
+# [9.8.0](https://github.com/pluskal/entity-controller/compare/v9.7.6...v9.8.0) (2026-04-06)
+
+### Features
+
+* **forced_sensors** – New `forced_sensors` config key. Sensors listed here bypass `blocked`, `constrained`, and `overridden` states and immediately activate the controller via a new `force_activate` state-machine trigger. Useful for panic buttons, manual overrides, or priority scenes.
+* **event_sensors** – New `event_sensors` config key. Accepts a list of HA bus event type strings. When any of those events fires on the HA event bus the controller treats it like a sensor turning on (transitions from `idle` / `active_timer` / `blocked` to `active`). Cancel callbacks are tracked and cleaned up on reconfiguration.
+* **block_timer_expires → idle fix** – When the block timer expired while all state entities were already off the controller was left stuck in `blocked`. The state machine now includes the missing transition: `blocked → idle` (condition `is_state_entities_off`).
+* **State persistence** – Controller state (`overridden`, `blocked`) is now persisted across HA restarts using `homeassistant.helpers.storage.Store`. The saved state is restored on startup and re-validated against live entity states before being applied.
+
+### Bug Fixes
+
+* `block_timer_expires` with entities already off no longer leaves the controller stuck in `blocked` state (closes #310).
+
+### Tests
+
+* 47 new behavioral tests in `tests/test_legacy_behaviors.py` cover sensor flows, state-entity blocking, override entities, duration sensors, stay-on mode, multiple sensors, config registration, custom state strings, and constrained-state behavior.
+* 28 tests in `tests/test_new_features.py` cover all four new feature areas end-to-end.
+* All 7 permanently-skipped legacy test files are retained as historical artifacts; their scenarios are now covered by the two new files above.
+
 <a name="9.7.6"></a>
 ## [9.7.6](https://github.com/danobot/entity-controller/compare/v9.7.5...v9.7.6) (2024-05-04)
 

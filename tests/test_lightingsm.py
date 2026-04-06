@@ -3,6 +3,13 @@
 import asyncio
 import logging
 import pytest
+try:
+    from homeassistant.components import async_setup as _ha_async_setup  # noqa: F401
+except ImportError:
+    pytest.skip(
+        "requires homeassistant.components.async_setup (removed in HA 2025.x+)",
+        allow_module_level=True,
+    )
 from unittest.mock import patch
 from datetime import timedelta
 from homeassistant.core import CoreState, State, Context

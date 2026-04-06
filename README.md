@@ -33,4 +33,56 @@ All contributions are welcome, including raising issues. Expect to be involved i
 
 The `close-issue` bot is ruthless. Please provide all requested information to allow me to help you.
 
+---
+
+# Configuration Reference
+
+## Basic options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `sensor` / `sensors` | entity id(s) | — | Motion/binary sensor(s) that trigger activation |
+| `entity` / `entities` | entity id(s) | — | Entities to control (lights, switches, …) |
+| `delay` | seconds | 180 | How long to stay active after the last trigger |
+
+## Forced Sensors (`forced_sensors`)
+
+Sensors listed under `forced_sensors` bypass the `blocked`, `constrained`, and `overridden` states and **immediately activate** the controller regardless of its current state. This is useful for panic buttons, manual overrides, or priority scenes where the normal blocking logic should be ignored.
+
+```yaml
+entity_controller:
+  living_room:
+    sensor: binary_sensor.pir
+    entity: light.ceiling
+    forced_sensors:
+      - binary_sensor.panic_button   # always activates, even when overridden
+```
+
+The `forced_sensors` list accepts any Home Assistant entity id whose state changes to one of the sensor-on states (default: `on`, `playing`, `home`, `True`).
+
+## HA Bus Event Sensors (`event_sensors`)
+
+`event_sensors` accepts a list of **HA bus event type strings**. When any of those events fires on the event bus the controller treats it the same as a sensor turning on — transitioning from `idle`, `active_timer`, or `blocked` to `active`. Unlike `forced_sensors`, event sensors respect the `overridden` and `constrained` states.
+
+```yaml
+entity_controller:
+  hallway:
+    sensor: binary_sensor.door
+    entity: light.hallway
+    event_sensors:
+      - my_custom_event          # fires when HA fires this bus event
+      - zwave_js.value_updated   # or any other HA event type
+```
+
+Cancel callbacks are tracked automatically and cleaned up whenever the configuration is refreshed.
+
+## State Persistence
+
+EC now persists the `overridden` and `blocked` states across Home Assistant restarts using the built-in HA storage layer. On startup the saved state is re-validated against the current live entity states before being applied, so stale persisted states are silently discarded.
+
+No configuration is required — persistence is enabled automatically.
+
+## Block Timer Fix
+
+Prior to v9.8.0, when the block timer expired while all state entities were already off, the controller was left stuck in the `blocked` state (issue #310). This has been fixed: the state machine now correctly transitions `blocked → idle` when the block timer expires and all state entities are off.
 

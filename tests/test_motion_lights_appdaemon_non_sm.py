@@ -1,4 +1,8 @@
 import pytest
+from unittest.mock import patch
+
+pytest.importorskip("apps", reason="AppDaemon 'apps' module not available in this environment")
+
 from apps.motion_light import MotionLight
 # from apps.demo_class import MotionLight
 

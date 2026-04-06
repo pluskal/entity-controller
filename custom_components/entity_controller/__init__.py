@@ -23,6 +23,7 @@ Project Page:     https://danielbkr.net/projects/entity-controller/
 Documentation:    https://github.com/danobot/entity-controller
 """
 import asyncio
+import functools
 import hashlib
 import logging
 import re
@@ -47,6 +48,9 @@ from transitions.extensions import HierarchicalMachine as Machine
 from homeassistant.helpers.service import async_call_from_config
 
 DEPENDENCIES = ["light", "sensor", "binary_sensor", "cover", "fan", "media_player"]
+from homeassistant.helpers.storage import Store
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+
 from .const import (
     DOMAIN,
     DOMAIN_SHORT,
@@ -99,7 +103,14 @@ from .const import (
     CONSTRAIN_START,
     CONSTRAIN_END,
 
-    CONTEXT_ID_CHARACTER_LIMIT
+    CONTEXT_ID_CHARACTER_LIMIT,
+
+    # New features
+    CONF_FORCED_SENSORS,
+    CONF_EVENT_SENSORS,
+    CONF_EVENT_SENSOR_TYPE,
+    STORAGE_VERSION,
+    STORAGE_KEY_PREFIX,
 )
 
 from .entity_services import (
@@ -108,7 +119,7 @@ from .entity_services import (
 
 
 
-VERSION = '9.7.6'
+VERSION = '9.8.0'
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -156,6 +167,8 @@ ENTITY_SCHEMA = vol.Schema(
         vol.Optional(CONF_NIGHT_MODE, default=None): MODE_SCHEMA,
         vol.Optional(CONF_STATE_ATTRIBUTES_IGNORE, default=[]): cv.ensure_list,
         vol.Optional(CONF_IGNORED_EVENT_SOURCES, default=[]): cv.ensure_list,
+        vol.Optional(CONF_FORCED_SENSORS, default=[]): cv.entity_ids,
+        vol.Optional(CONF_EVENT_SENSORS, default=[]): vol.All(cv.ensure_list, [cv.string]),
         vol.Optional(CONF_SERVICE_DATA, default=None): vol.Coerce(
             dict
         ),
@@ -371,6 +384,24 @@ async def async_setup(hass, config):
     # Enter blocked state when component is enabled and entity is on
     machine.add_transition(trigger="blocked", source="constrained", dest="blocked", conditions=["is_block_enabled"])
 
+    # Phase 1 fix: block_timer_expires → idle when state entities are already off.
+    # Without this transition the SM could be stuck in blocked when entities turned
+    # off before the block timeout fired.
+    machine.add_transition(
+        trigger="block_timer_expires",
+        source="blocked",
+        dest="idle",
+        conditions=["is_state_entities_off"],
+    )
+
+    # Phase 3: force_activate — triggered by forced sensors.
+    # Bypasses blocked, constrained and overridden states entirely.
+    machine.add_transition(
+        trigger="force_activate",
+        source=["idle", "blocked", "constrained", "overridden", "active_timer"],
+        dest="active",
+    )
+
     for myconfig in config[DOMAIN]:
         _LOGGER.info("Domain Configuration: " + str(myconfig))
         for key, config in myconfig.items():
@@ -514,6 +545,9 @@ class Model:
         self.stateEntities = []
         self.controlEntities = []
         self.sensorEntities = []
+        self.forcedSensorEntities = []
+        self.eventSensorTypes = []
+        self._event_sensor_cancel_callbacks = []
         self.triggerOnDeactivate = []
         self.triggerOnActivate = []
         self.timer_handle = None
@@ -536,6 +570,7 @@ class Model:
         self.log = logging.getLogger(__name__ + "." + config.get(CONF_NAME))
         self.ignored_event_sources = []
         self.context = None
+        self._store = None  # HA storage for state persistence
 
         self.log.debug(
             "Initialising EntityController entity with this configuration: "
@@ -552,7 +587,7 @@ class Model:
 
         event.async_call_later(self.hass, STARTUP_DELAY, self.startup_delay_callback)
 
-    def startup_delay_callback(self, evt):
+    async def startup_delay_callback(self, evt):
         config = self.config
         self.config_static_strings(config)
         self.config_control_entities(config)
@@ -560,6 +595,8 @@ class Model:
             config
         )  # must come after config_control_entities (uses control entities if not set)
         self.config_sensor_entities(config)
+        self.config_forced_sensor_entities(config)
+        self.config_event_sensors(config)
         self.config_override_entities(config)
         self.config_transition_behaviours(config)
         self.config_off_entities(config)
@@ -573,11 +610,19 @@ class Model:
         self.config_other(config)
         self.prepare_service_data()
 
-        if len(self.overrideEntities) > 0 and self.is_override_state_on():
-            self.override()
-            self.update(overridden_at=str(datetime.now()))
-        else:
-            self.start_monitoring()
+        # Phase 2: Set up state persistence store and register shutdown handler
+        self._store = Store(self.hass, STORAGE_VERSION, self._storage_key())
+        self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self._async_save_state)
+
+        # Phase 2: Attempt to restore persisted state before the first transition
+        restored = await self._async_restore_state()
+
+        if not restored:
+            if len(self.overrideEntities) > 0 and self.is_override_state_on():
+                self.override()
+                self.update(overridden_at=str(datetime.now()))
+            else:
+                self.start_monitoring()
 
     def update(self, wait=False, **kwargs):
         """ Called from different methods to report a state attribute change """
@@ -716,6 +761,55 @@ class Model:
 
         if self.is_blocked() or self.is_active_stay_on(): # if statement required to avoid MachineErrors, cleaner than adding transitions to all possible states.
             self.enable()
+
+    @callback
+    def forced_sensor_state_change(self, ev):
+        """State change callback for forced sensor entities (Phase 3).
+
+        Forced sensors bypass blocked, constrained, and overridden states and
+        immediately activate the controller.
+        """
+        entity_id = ev.data["entity_id"]
+        old = ev.data["old_state"]
+        new = ev.data["new_state"]
+        self.log.debug(
+            "forced_sensor_state_change :: %s → %s (state=%s)",
+            entity_id,
+            new.state if new else None,
+            self.state,
+        )
+
+        try:
+            if new.state == old.state:
+                self.log.debug("forced_sensor_state_change :: Ignore attribute-only change")
+                return
+        except AttributeError:
+            pass
+
+        if new and self.matches(new.state, self.SENSOR_ON_STATE):
+            self.set_context(new.context)
+            self.update(last_triggered_by=entity_id)
+            self.log.debug(
+                "forced_sensor_state_change :: Force-activating from state '%s'", self.state
+            )
+            self.force_activate()
+
+    @callback
+    def ha_event_sensor_callback(self, event_type, ev):
+        """HA bus event callback for event-bus sensors (Phase 6).
+
+        Subscribes to arbitrary HA bus events and triggers sensor_on when
+        the configured event fires, regardless of any attached event data.
+        """
+        self.log.debug(
+            "ha_event_sensor_callback :: Received HA bus event '%s' (state=%s)",
+            event_type,
+            self.state,
+        )
+        self.set_context(None)
+        self.update(last_triggered_by=f"ha_event:{event_type}")
+        if self.is_idle() or self.is_active_timer() or self.is_blocked():
+            self.sensor_on()
 
     def _start_timer(self):
         self.log.info("_start_timer :: Light params: " + str(self.lightParams))
@@ -902,10 +996,12 @@ class Model:
     def on_enter_overridden(self):
         self.log.debug("Entering overridden")
         self.do_transition_behaviour(CONF_ON_ENTER_OVERRIDDEN)
+        self._schedule_save_state()
 
     def on_exit_overridden(self):
         self.log.debug("Exiting overridden")
         self.do_transition_behaviour(CONF_ON_EXIT_OVERRIDDEN)
+        self._schedule_save_state()
 
     def on_enter_active(self):
         self.log.debug("Entering active")
@@ -938,12 +1034,14 @@ class Model:
             self.block_timer_handle = Timer(self.block_timeout, self.block_timer_expire)
             self.block_timer_handle.start()
             self.update(block_timeout=self.block_timeout)
+        self._schedule_save_state()
 
     def on_exit_blocked(self):
         self.log.debug("Exiting blocked")
         self.do_transition_behaviour(CONF_ON_EXIT_BLOCKED)
         if self.block_timer_handle and self.block_timer_handle.is_alive():
             self.block_timer_handle.cancel()
+        self._schedule_save_state()
 
     def on_enter_constrained(self):
         self.log.debug("Entering constrained")
@@ -1024,16 +1122,58 @@ class Model:
         self.add(self.sensorEntities, config, CONF_SENSOR)
         self.add(self.sensorEntities, config, CONF_SENSORS)
 
-        if len(self.sensorEntities) == 0:
+        if len(self.sensorEntities) == 0 and len(config.get(CONF_FORCED_SENSORS, [])) == 0 \
+                and len(config.get(CONF_EVENT_SENSORS, [])) == 0:
             self.log.error(
                 "No sensor entities defined. You must define at least one sensor entity."
             )
 
         self.log.debug("Sensor Entities: " +  pprint.pformat(self.sensorEntities))
 
-        event.async_track_state_change_event(
-            self.hass, self.sensorEntities, self.sensor_state_change
-        )
+        if self.sensorEntities:
+            event.async_track_state_change_event(
+                self.hass, self.sensorEntities, self.sensor_state_change
+            )
+
+    def config_forced_sensor_entities(self, config):
+        """Phase 3: Configure forced sensors that bypass blocked/constrained/overridden.
+
+        Forced sensors trigger ``force_activate`` instead of ``sensor_on``, so
+        the controller transitions directly to the ``active`` state from any
+        state (including ``blocked``, ``constrained``, and ``overridden``).
+        """
+        self.forcedSensorEntities = []
+        self.add(self.forcedSensorEntities, config, CONF_FORCED_SENSORS)
+        if self.forcedSensorEntities:
+            self.log.debug("Forced Sensor Entities: %s", pprint.pformat(self.forcedSensorEntities))
+            event.async_track_state_change_event(
+                self.hass, self.forcedSensorEntities, self.forced_sensor_state_change
+            )
+
+    def config_event_sensors(self, config):
+        """Phase 6: Configure HA bus event sensors.
+
+        Each entry in ``event_sensors`` is a HA bus event type string.  When
+        that event fires the controller treats it the same way as a sensor
+        turning on (transitions to active from idle/active_timer/blocked).
+        """
+        self.eventSensorTypes = []
+        for cancel in self._event_sensor_cancel_callbacks:
+            cancel()
+        self._event_sensor_cancel_callbacks = []
+
+        raw = config.get(CONF_EVENT_SENSORS, [])
+        if not raw:
+            return
+
+        for event_type in raw:
+            self.eventSensorTypes.append(event_type)
+            self.log.debug("config_event_sensors :: Subscribing to HA bus event '%s'", event_type)
+            cancel = self.hass.bus.async_listen(
+                event_type,
+                functools.partial(self.ha_event_sensor_callback, event_type),
+            )
+            self._event_sensor_cancel_callbacks.append(cancel)
 
     def config_static_strings(self, config):
         DEFAULT_ON = ["on", "playing", "home", "True"]
@@ -1208,8 +1348,75 @@ class Model:
         self.update(sensor_type=self.sensor_type)
 
     # =====================================================
-    #    E V E N T   C A L L B A C K S
+    #    S T A T E   P E R S I S T E N C E  (Phase 2)
     # =====================================================
+
+    def _storage_key(self):
+        """Return a unique storage key for this EC instance."""
+        safe_name = re.sub(r'[^a-z0-9_]+', '_', self.name.lower()).strip('_')
+        return f"{STORAGE_KEY_PREFIX}{safe_name}"
+
+    def _schedule_save_state(self):
+        """Schedule an async state save without blocking the caller."""
+        if self._store is not None:
+            self.hass.async_create_task(self._async_save_state())
+
+    async def _async_save_state(self, *_args):
+        """Persist the current EC state to HA storage."""
+        if self._store is None:
+            return
+        data = {
+            "state": self.state,
+            "saved_at": str(datetime.now()),
+        }
+        self.log.debug("_async_save_state :: Saving state: %s", data)
+        await self._store.async_save(data)
+
+    async def _async_restore_state(self):
+        """Load persisted state from HA storage and restore if applicable.
+
+        Returns True when the state was successfully restored so the caller
+        can skip the normal startup evaluation.
+        """
+        if self._store is None:
+            return False
+        try:
+            data = await self._store.async_load()
+        except (OSError, ValueError) as exc:
+            self.log.warning("_async_restore_state :: Failed to load persisted state: %s", exc)
+            return False
+
+        if not data:
+            self.log.debug("_async_restore_state :: No persisted state found")
+            return False
+
+        saved_state = data.get("state")
+        self.log.debug("_async_restore_state :: Restoring state '%s' (saved at %s)",
+                       saved_state, data.get("saved_at"))
+
+        if saved_state == "overridden":
+            # Only restore overridden if an override entity is actually on, so
+            # we do not get stuck in overridden when the override cleared while HA
+            # was stopped.
+            if len(self.overrideEntities) > 0 and self.is_override_state_on():
+                self.override()
+                self.update(overridden_at=str(datetime.now()), notes="Restored from storage")
+                return True
+            # Override is gone — fall through to normal startup evaluation
+            return False
+
+        if saved_state == "blocked":
+            # Only restore blocked if the state entity is still on (otherwise the
+            # entity was turned off while HA was down — go to idle instead).
+            if self.is_state_entities_on() and self.is_block_enabled():
+                self.start_monitoring()
+                self.sensor_on()  # triggers idle→active→blocked via normal transitions
+                return True
+            return False
+
+        # For all other states (idle, constrained, active_timer, etc.) let the
+        # normal startup evaluation run.
+        return False
 
     @callback
     def constrain_entity(self, evt):
@@ -1760,6 +1967,8 @@ class Model:
         self.log.debug("--------------------------------------------------")
         self.log.debug("Entity Controller       %s", self.name)
         self.log.debug("Sensor Entities         %s", str(self.sensorEntities))
+        self.log.debug("Forced Sensor Entities: %s", str(self.forcedSensorEntities))
+        self.log.debug("Event Bus Sensors:      %s", str(self.eventSensorTypes))
         self.log.debug("Control Entities:       %s", str(self.controlEntities))
         self.log.debug("State Entities:         %s", str(self.stateEntities))
         self.log.debug("Activate Trigger E.:    %s", str(self.triggerOnActivate))
