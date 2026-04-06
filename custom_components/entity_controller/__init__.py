@@ -23,6 +23,7 @@ Project Page:     https://danielbkr.net/projects/entity-controller/
 Documentation:    https://github.com/danobot/entity-controller
 """
 import asyncio
+import functools
 import hashlib
 import logging
 import re
@@ -616,14 +617,12 @@ class Model:
         # Phase 2: Attempt to restore persisted state before the first transition
         restored = await self._async_restore_state()
 
-        if restored:
-            # State was restored; do not perform the normal startup evaluation
-            pass
-        elif len(self.overrideEntities) > 0 and self.is_override_state_on():
-            self.override()
-            self.update(overridden_at=str(datetime.now()))
-        else:
-            self.start_monitoring()
+        if not restored:
+            if len(self.overrideEntities) > 0 and self.is_override_state_on():
+                self.override()
+                self.update(overridden_at=str(datetime.now()))
+            else:
+                self.start_monitoring()
 
     def update(self, wait=False, **kwargs):
         """ Called from different methods to report a state attribute change """
@@ -1170,14 +1169,10 @@ class Model:
         for event_type in raw:
             self.eventSensorTypes.append(event_type)
             self.log.debug("config_event_sensors :: Subscribing to HA bus event '%s'", event_type)
-            # Use a closure to capture event_type correctly
-            def _make_callback(et):
-                @callback
-                def _cb(ev):
-                    self.ha_event_sensor_callback(et, ev)
-                return _cb
-
-            cancel = self.hass.bus.async_listen(event_type, _make_callback(event_type))
+            cancel = self.hass.bus.async_listen(
+                event_type,
+                functools.partial(self.ha_event_sensor_callback, event_type),
+            )
             self._event_sensor_cancel_callbacks.append(cancel)
 
     def config_static_strings(self, config):
@@ -1358,7 +1353,7 @@ class Model:
 
     def _storage_key(self):
         """Return a unique storage key for this EC instance."""
-        safe_name = re.sub(r'[^a-z0-9_]', '_', self.name.lower())
+        safe_name = re.sub(r'[^a-z0-9_]+', '_', self.name.lower()).strip('_')
         return f"{STORAGE_KEY_PREFIX}{safe_name}"
 
     def _schedule_save_state(self):
@@ -1387,7 +1382,7 @@ class Model:
             return False
         try:
             data = await self._store.async_load()
-        except Exception as exc:  # pylint: disable=broad-except
+        except (OSError, ValueError) as exc:
             self.log.warning("_async_restore_state :: Failed to load persisted state: %s", exc)
             return False
 
