@@ -1,5 +1,7 @@
 import pytest
 
+pytest.importorskip("apps", reason="AppDaemon 'apps' module not available in this environment")
+
 from apps.demo_class import MotionLight
 
 # Important:
