@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file. See [standa
 ### Bug Fixes
 
 * `block_timer_expires` with entities already off no longer leaves the controller stuck in `blocked` state (closes #310).
+* **`grace_period`** – Re-introduced the `grace_period` configuration option to fix spurious `blocked` state transitions caused by cloud/gateway integrations (e.g. Tahoma/Somfy) that do not propagate Home Assistant's service-call context to their state-change events. When EC calls a service on such an integration the delayed state feedback arrives with a fresh, unrelated context; `is_ignored_context()` therefore does not suppress it, `control()` fires, and the controller enters `blocked`. Setting `grace_period` to a value that covers the integration's worst-case round-trip latency suppresses these false positives. The option is disabled by default (`null`) so no existing behaviour is changed.
 
 ### Tests
 

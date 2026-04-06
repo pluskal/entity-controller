@@ -86,3 +86,28 @@ No configuration is required — persistence is enabled automatically.
 
 Prior to v9.8.0, when the block timer expired while all state entities were already off, the controller was left stuck in the `blocked` state (issue #310). This has been fixed: the state machine now correctly transitions `blocked → idle` when the block timer expires and all state entities are off.
 
+## Grace Period (`grace_period`)
+
+**Problem:** Cloud and gateway integrations — such as [Tahoma / Somfy](https://www.home-assistant.io/integrations/tahoma/) — update entity states asynchronously by polling the cloud. When EC calls `light.turn_on`, the integration sends the command upstream and only confirms the new state seconds later through its next poll cycle. That delayed state-change event is emitted with a fresh HA context that has no relationship to the original EC service call. Because EC's self-suppression mechanism (`is_ignored_context`) looks for its own context id prefix, it misses the late-arriving event, fires `control()`, finds the state entity on, and transitions `active_timer → blocked`.
+
+**Solution:** Set `grace_period` to a value (in seconds) that covers the integration's worst-case round-trip latency. EC will then ignore all state-entity changes that arrive within that window after any service call, preventing false `blocked` transitions.
+
+```yaml
+entity_controller:
+  room_108:
+    sensor: binary_sensor.108_motion_hs_portal_occupancy
+    entity:
+      - light.108_f
+      - light.108_i
+      - light.led_1
+      - light.led_3
+    delay: 300
+    grace_period: 10   # covers Tahoma's ~5–6 s cloud round-trip latency
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `grace_period` | integer (seconds) | `null` (disabled) | Duration after each service call during which state-entity changes are ignored. Set to a value slightly above your integration's worst-case latency. |
+
+**When to use it:** Only needed for integrations where state-change events arrive with a context unrelated to the original EC service call (cloud integrations, gateway bridges, etc.). Standard local integrations — where HA propagates the service-call context through to the state-change event — are handled correctly by the existing context check and do not need this option.
+
