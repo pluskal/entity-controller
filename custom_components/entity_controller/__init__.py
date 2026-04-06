@@ -103,6 +103,8 @@ from .const import (
     CONSTRAIN_START,
     CONSTRAIN_END,
 
+    CONF_IGNORE_STATE_CHANGES_UNTIL,
+
     CONTEXT_ID_CHARACTER_LIMIT,
 
     # New features
@@ -163,7 +165,7 @@ ENTITY_SCHEMA = vol.Schema(
         vol.Optional(CONF_STATE_ENTITIES, default=[]): cv.entity_ids,
         vol.Optional(CONF_BLOCK_TIMEOUT, default=None): cv.positive_int,
         vol.Optional(CONF_DISABLE_BLOCK, default=False): cv.boolean,
-        # vol.Optional(CONF_IGNORE_STATE_CHANGES_UNTIL, default=None): cv.positive_int,
+        vol.Optional(CONF_IGNORE_STATE_CHANGES_UNTIL, default=None): vol.Any(None, cv.positive_int),
         vol.Optional(CONF_NIGHT_MODE, default=None): MODE_SCHEMA,
         vol.Optional(CONF_STATE_ATTRIBUTES_IGNORE, default=[]): cv.ensure_list,
         vol.Optional(CONF_IGNORED_EVENT_SOURCES, default=[]): cv.ensure_list,
@@ -726,6 +728,9 @@ class Model:
         if self.is_ignored_context(new.context):
             self.log.debug("state_entity_state_change :: Ignoring this state change because it came from %s" % (new.context.id))
             return
+        if self.is_within_grace_period():
+            self.log.debug("state_entity_state_change :: Ignoring this state change because we are within the grace period (until %s)", self.ignore_state_changes_until)
+            return
 
         #  If the state changed, we definitely want to handle the transition. If only attributes changed, we'll check if the new attributes are significant (i.e., not being ignored).
         try:
@@ -890,10 +895,19 @@ class Model:
     def is_override_state_off(self):
         return self._override_entity_state() is None
 
-    # def is_within_grace_period(self):
-    #     """ Dtermines if the last service call EC made was within the last 2 seconds.
-    #     This is important or else EC will react to state changes caused by EC itself which results in going into blocked state."""
-    #     return datetime.now() < self.ignore_state_changes_until
+    def is_within_grace_period(self):
+        """Determines whether the last service call EC made was within the configured grace_period.
+
+        This is a fallback for integrations (e.g. cloud/gateway integrations like Tahoma) that
+        do not propagate the original HA context to their state-change events.  For those
+        integrations the Context-API check in is_ignored_context() is insufficient because the
+        delayed state update arrives with a fresh, unrelated context.  Setting grace_period to a
+        value that covers the integration's worst-case latency prevents EC from entering the
+        blocked state due to its own delayed state feedback.
+        """
+        if not self.grace_period:
+            return False
+        return datetime.now() < self.ignore_state_changes_until
 
     def is_override_state_on(self):
         return self._override_entity_state() is not None
@@ -1326,6 +1340,7 @@ class Model:
         self.config[CONF_SENSOR_RESETS_TIMER] = config.get(CONF_SENSOR_RESETS_TIMER)
 
         self.block_timeout = config.get(CONF_BLOCK_TIMEOUT, None)
+        self.grace_period = config.get(CONF_IGNORE_STATE_CHANGES_UNTIL, None)
         self.disable_block = config.get(CONF_DISABLE_BLOCK, False)
         self.image_prefix = config.get("image_prefix", "/fsm_diagram_")
         self.image_path = config.get("image_path", "/conf/temp")
@@ -1778,8 +1793,9 @@ class Model:
     def call_service(self, entity, service, **service_data):
         """ Helper for calling HA services with the correct parameters """
         self.log.debug("call_service :: Calling service " + service + " on " + entity)
-        # self.ignore_state_changes_until = datetime.now() + timedelta(seconds=self.config.get(CONF_IGNORE_STATE_CHANGES_UNTIL, 2))
-        # self.log.debug("call_service :: Setting ignore_state_changes_until to " + str(self.ignore_state_changes_until))
+        if self.grace_period:
+            self.ignore_state_changes_until = datetime.now() + timedelta(seconds=self.grace_period)
+            self.log.debug("call_service :: grace_period active, ignoring state changes until %s", self.ignore_state_changes_until)
 
         domain, e = entity.split(".")
         if service in ['turn_on','turn_off'] and domain in self.homeassistant_turn_on_domains:
