@@ -2,7 +2,22 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
-<a name="9.8.1"></a>
+<a name="9.8.2"></a>
+## [9.8.2](https://github.com/pluskal/entity-controller/compare/v9.8.1...v9.8.2) (2026-04-07)
+
+
+### Bug Fixes
+
+* **`block_timer_expires` catch-all** – Added an unconditional `blocked → idle` fallback transition for `block_timer_expires`. Previously, when the block timer fired while the trigger sensor was already off but state entities were still reporting "on" (e.g. delayed feedback from cloud/gateway integrations such as Overkiz/Tahoma), none of the existing `block_timer_expires` transitions matched and the controller remained stuck in `blocked` indefinitely past its `block_timeout`. The new catch-all fires for every case not handled by the earlier "go to `active`" transitions, guaranteeing the controller always exits `blocked` when the timer fires.
+
+
+### Tests
+
+* `test_block_timer_expires_to_idle_when_entities_on_but_sensor_off` — regression test for the missing catch-all scenario (Phase 2 fix).
+* `test_block_timer_expires_catchall_transition_present_in_machine` — structural test asserting the unconditional transition exists in the state machine.
+
+
+
 ## [9.8.1](https://github.com/pluskal/entity-controller/compare/v9.8.0...v9.8.1) (2026-04-06)
 
 
