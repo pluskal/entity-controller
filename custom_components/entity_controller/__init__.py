@@ -396,6 +396,20 @@ async def async_setup(hass, config):
         conditions=["is_state_entities_off"],
     )
 
+    # Phase 2 fix: catch-all for block_timer_expires → idle.
+    # Covers the case where state entities are still reported as on (e.g. due to
+    # slow cloud/gateway feedback from integrations like Overkiz/Tahoma) but the
+    # trigger sensor has already turned off.  Without this transition the controller
+    # would remain stuck in blocked indefinitely because none of the earlier
+    # block_timer_expires conditions (which require is_sensor_on or
+    # is_state_entities_off) would match.  This transition is unconditional so it
+    # acts as a guaranteed fallback for every case not handled above.
+    machine.add_transition(
+        trigger="block_timer_expires",
+        source="blocked",
+        dest="idle",
+    )
+
     # Phase 3: force_activate — triggered by forced sensors.
     # Bypasses blocked, constrained and overridden states entirely.
     machine.add_transition(

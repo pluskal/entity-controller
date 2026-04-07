@@ -135,6 +135,12 @@ def _add_machine_transitions(machine):
         trigger="block_timer_expires", source="blocked", dest="idle",
         conditions=["is_state_entities_on", "is_duration_sensor", "is_sensor_off"],
     )
+    # Phase 2 fix: catch-all — covers sensor_off + state_entities_on (slow
+    # cloud integrations like Overkiz that report stale "on" state after
+    # block_timeout fires, while the trigger sensor is already off).
+    machine.add_transition(
+        trigger="block_timer_expires", source="blocked", dest="idle",
+    )
     machine.add_transition(
         trigger="control", source="active_timer", dest="idle",
         conditions=["is_state_entities_off"],
@@ -353,6 +359,60 @@ class TestBlockTimerExpiresIdleTransition:
         assert has_entities_off_transition, (
             "Expected a block_timer_expires→idle transition conditioned on "
             "is_state_entities_off, but it was not found in the machine"
+        )
+
+    def test_block_timer_expires_to_idle_when_entities_on_but_sensor_off(self):
+        """block_timer_expires must go blocked→idle when state entities are still
+        on (e.g. slow cloud/Overkiz feedback) but the trigger sensor is already
+        off.
+
+        This is the Phase 2 fix.  Previously no transition matched this
+        combination (is_state_entities_on=True, is_sensor_on=False,
+        is_duration_sensor=False, is_event_sensor=False), leaving EC stuck in
+        blocked past its block_timeout.
+        """
+        model = _build_model()
+
+        model.is_state_entities_on = MagicMock(return_value=True)
+        model.is_state_entities_off = MagicMock(return_value=False)
+        model.is_block_enabled = MagicMock(return_value=True)
+        model.is_sensor_on = MagicMock(return_value=True)
+        model.is_sensor_off = MagicMock(return_value=False)
+        model.is_event_sensor = MagicMock(return_value=False)
+        model.is_duration_sensor = MagicMock(return_value=False)
+
+        model.sensor_on()
+        assert model.state == "blocked", f"Expected blocked, got {model.state}"
+
+        # Sensor has gone off, but state entities still report on (slow update)
+        model.is_sensor_on = MagicMock(return_value=False)
+        model.is_sensor_off = MagicMock(return_value=True)
+
+        model.block_timer_expires()
+
+        assert model.state == "idle", (
+            f"Expected idle after block_timer_expires with sensor off + entities "
+            f"still on, got {model.state}"
+        )
+
+    def test_block_timer_expires_catchall_transition_present_in_machine(self):
+        """The machine must include an unconditional block_timer_expires→idle
+        catch-all transition (Phase 2 fix)."""
+        from transitions.extensions import HierarchicalMachine as Machine
+        from custom_components.entity_controller.const import STATES
+
+        machine = Machine(states=STATES, initial="pending", finalize_event="finalize")
+        _add_machine_transitions(machine)
+
+        blocked_transitions = [
+            t for t in machine.get_transitions("block_timer_expires")
+            if t.source == "blocked"
+        ]
+        # An unconditional transition has an empty conditions list.
+        has_catchall = any(len(t.conditions) == 0 for t in blocked_transitions)
+        assert has_catchall, (
+            "Expected an unconditional block_timer_expires→idle catch-all "
+            "transition (Phase 2 fix) but it was not found in the machine"
         )
 
 
