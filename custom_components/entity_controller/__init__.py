@@ -268,27 +268,33 @@ async def async_setup(hass, config):
     machine.add_transition(
         trigger="enable",
         source="overridden",
+        dest=None,
+        conditions=["is_override_state_on"],
+    )
+    machine.add_transition(
+        trigger="enable",
+        source="overridden",
         dest="idle",
-        conditions=["is_state_entities_off"],
+        conditions=["is_override_state_off", "is_state_entities_off"],
     )
     # If a device leaving overridden is on, we do not necessarily want to shut it off immediately. We simply want EC to stop controlling it. To do that, we'll move it to active, to simulate an EC trigger, and we'll see if it exits on its own. This works for event sensors, of course, and it will also work for duration sensors if the current state is on. A duration sensor that is off now will never expire on its own, though, so in that case, we'll assume the target is 'idle'.
     machine.add_transition(
         trigger="enable",
         source="overridden",
         dest="active",
-        conditions=["is_state_entities_on", "is_event_sensor"],
+        conditions=["is_override_state_off", "is_state_entities_on", "is_event_sensor"],
     )
     machine.add_transition(
         trigger="enable",
         source="overridden",
         dest="active",
-        conditions=["is_state_entities_on", "is_sensor_on"],
+        conditions=["is_override_state_off", "is_state_entities_on", "is_sensor_on"],
     )  # This could be duration && on, but it will also work for any event sensor, so it's simpler to just write 'on'
     machine.add_transition(
         trigger="enable",
         source="overridden",
         dest="idle",
-        conditions=["is_state_entities_on", "is_duration_sensor", "is_sensor_off"],
+        conditions=["is_override_state_off", "is_state_entities_on", "is_duration_sensor", "is_sensor_off"],
     )
 
     machine.add_transition(
@@ -1496,6 +1502,12 @@ class Model:
         )
 
         self.update(start_time=parsed_start)
+
+        if self.is_overridden() and self.is_override_state_on():
+            self.log.debug(
+                "start_time_callback :: Override is still active; staying overridden"
+            )
+            return
 
         if self.is_state_entities_on() and self.is_block_enabled():
             self.blocked()

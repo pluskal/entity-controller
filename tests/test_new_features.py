@@ -82,20 +82,24 @@ def _add_machine_transitions(machine):
         conditions=["is_block_enabled"],
     )
     machine.add_transition(
-        trigger="enable", source="overridden", dest="idle",
-        conditions=["is_state_entities_off"],
-    )
-    machine.add_transition(
-        trigger="enable", source="overridden", dest="active",
-        conditions=["is_state_entities_on", "is_event_sensor"],
-    )
-    machine.add_transition(
-        trigger="enable", source="overridden", dest="active",
-        conditions=["is_state_entities_on", "is_sensor_on"],
+        trigger="enable", source="overridden", dest=None,
+        conditions=["is_override_state_on"],
     )
     machine.add_transition(
         trigger="enable", source="overridden", dest="idle",
-        conditions=["is_state_entities_on", "is_duration_sensor", "is_sensor_off"],
+        conditions=["is_override_state_off", "is_state_entities_off"],
+    )
+    machine.add_transition(
+        trigger="enable", source="overridden", dest="active",
+        conditions=["is_override_state_off", "is_state_entities_on", "is_event_sensor"],
+    )
+    machine.add_transition(
+        trigger="enable", source="overridden", dest="active",
+        conditions=["is_override_state_off", "is_state_entities_on", "is_sensor_on"],
+    )
+    machine.add_transition(
+        trigger="enable", source="overridden", dest="idle",
+        conditions=["is_override_state_off", "is_state_entities_on", "is_duration_sensor", "is_sensor_off"],
     )
     machine.add_transition(
         trigger="enter", source="active", dest="active_timer", unless="will_stay_on",
@@ -921,3 +925,233 @@ class TestGracePeriod:
         assert model.state == "active_timer", (
             f"Expected active_timer (grace period suppressed), got {model.state}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Overridden state stickiness — enable() and start_time_callback()
+# ---------------------------------------------------------------------------
+
+class TestOverriddenStickiness:
+    """Tests for the fix that keeps the controller in `overridden` while an
+    override entity remains ON.
+
+    Acceptance criteria:
+      - enable() from overridden while override is still ON keeps state overridden
+      - enable() from overridden while override is OFF still transitions as before
+      - start_time_callback() does not drop out of overridden when override remains active
+    """
+
+    def _make_model_overridden(self):
+        """Return a model in the `overridden` state."""
+        model = _build_model()
+        model.override()
+        assert model.state == "overridden"
+        return model
+
+    # ------------------------------------------------------------------
+    # enable() while override is ON
+    # ------------------------------------------------------------------
+
+    def test_enable_from_overridden_stays_overridden_when_override_on(self):
+        """enable() must not leave overridden while the override entity is still ON."""
+        model = self._make_model_overridden()
+        model.is_override_state_on = MagicMock(return_value=True)
+        model.is_override_state_off = MagicMock(return_value=False)
+        model.is_state_entities_off = MagicMock(return_value=True)
+
+        model.enable()
+
+        assert model.state == "overridden", (
+            f"Expected overridden after enable() with override still ON, got {model.state}"
+        )
+
+    # ------------------------------------------------------------------
+    # enable() while override is OFF — existing behaviour must be preserved
+    # ------------------------------------------------------------------
+
+    def test_enable_from_overridden_goes_idle_when_override_off_entities_off(self):
+        """enable() from overridden must go to idle when override is OFF and entities off."""
+        model = self._make_model_overridden()
+        model.is_override_state_on = MagicMock(return_value=False)
+        model.is_override_state_off = MagicMock(return_value=True)
+        model.is_state_entities_off = MagicMock(return_value=True)
+        model.is_state_entities_on = MagicMock(return_value=False)
+
+        model.enable()
+
+        assert model.state == "idle", (
+            f"Expected idle after enable() with override OFF + entities off, got {model.state}"
+        )
+
+    def test_enable_from_overridden_goes_active_when_override_off_entities_on_event(self):
+        """enable() from overridden must go to active when override OFF, entities ON (event sensor)."""
+        model = self._make_model_overridden()
+        model.is_override_state_on = MagicMock(return_value=False)
+        model.is_override_state_off = MagicMock(return_value=True)
+        model.is_state_entities_off = MagicMock(return_value=False)
+        model.is_state_entities_on = MagicMock(return_value=True)
+        model.is_event_sensor = MagicMock(return_value=True)
+        model.is_duration_sensor = MagicMock(return_value=False)
+        model.will_stay_on = MagicMock(return_value=False)
+
+        model.enable()
+
+        assert model.state in ("active", "active_timer"), (
+            f"Expected active/active_timer after enable() with override OFF + entities on "
+            f"(event sensor), got {model.state}"
+        )
+
+    def test_enable_from_overridden_goes_active_when_override_off_entities_on_sensor_on(self):
+        """enable() from overridden must go to active when override OFF, entities ON, sensor ON."""
+        model = self._make_model_overridden()
+        model.is_override_state_on = MagicMock(return_value=False)
+        model.is_override_state_off = MagicMock(return_value=True)
+        model.is_state_entities_off = MagicMock(return_value=False)
+        model.is_state_entities_on = MagicMock(return_value=True)
+        model.is_event_sensor = MagicMock(return_value=False)
+        model.is_sensor_on = MagicMock(return_value=True)
+        model.is_sensor_off = MagicMock(return_value=False)
+        model.is_duration_sensor = MagicMock(return_value=False)
+        model.will_stay_on = MagicMock(return_value=False)
+
+        model.enable()
+
+        assert model.state in ("active", "active_timer"), (
+            f"Expected active/active_timer after enable() with override OFF + sensor ON, "
+            f"got {model.state}"
+        )
+
+    def test_enable_from_overridden_goes_idle_when_override_off_duration_sensor_off(self):
+        """enable() from overridden must go to idle when override OFF, duration sensor OFF."""
+        model = self._make_model_overridden()
+        model.is_override_state_on = MagicMock(return_value=False)
+        model.is_override_state_off = MagicMock(return_value=True)
+        model.is_state_entities_off = MagicMock(return_value=False)
+        model.is_state_entities_on = MagicMock(return_value=True)
+        model.is_event_sensor = MagicMock(return_value=False)
+        model.is_sensor_on = MagicMock(return_value=False)
+        model.is_sensor_off = MagicMock(return_value=True)
+        model.is_duration_sensor = MagicMock(return_value=True)
+
+        model.enable()
+
+        assert model.state == "idle", (
+            f"Expected idle after enable() with override OFF + duration sensor off, "
+            f"got {model.state}"
+        )
+
+    # ------------------------------------------------------------------
+    # FSM structure tests
+    # ------------------------------------------------------------------
+
+    def test_noop_enable_transition_present_in_machine(self):
+        """The machine must include a no-op enable transition guarded by is_override_state_on."""
+        from transitions.extensions import HierarchicalMachine as Machine
+        from custom_components.entity_controller.const import STATES
+
+        machine = Machine(states=STATES, initial="pending", finalize_event="finalize")
+        _add_machine_transitions(machine)
+
+        overridden_enable = [
+            t for t in machine.get_transitions("enable")
+            if t.source == "overridden"
+        ]
+
+        def _condition_names(t):
+            return [
+                (c.func.__name__ if callable(c.func) else str(c.func))
+                for c in t.conditions
+            ]
+
+        has_noop = any(
+            "is_override_state_on" in _condition_names(t) and t.dest is None
+            for t in overridden_enable
+        )
+        assert has_noop, (
+            "Expected a no-op enable transition (dest=None) guarded by "
+            "is_override_state_on in overridden, but it was not found"
+        )
+
+    def test_all_leaving_enable_transitions_require_override_off(self):
+        """All enable transitions that leave overridden must require is_override_state_off."""
+        from transitions.extensions import HierarchicalMachine as Machine
+        from custom_components.entity_controller.const import STATES
+
+        machine = Machine(states=STATES, initial="pending", finalize_event="finalize")
+        _add_machine_transitions(machine)
+
+        overridden_enable = [
+            t for t in machine.get_transitions("enable")
+            if t.source == "overridden" and t.dest is not None
+        ]
+
+        def _condition_names(t):
+            return [
+                (c.func.__name__ if callable(c.func) else str(c.func))
+                for c in t.conditions
+            ]
+
+        for t in overridden_enable:
+            assert "is_override_state_off" in _condition_names(t), (
+                f"Transition enable overridden→{t.dest} is missing is_override_state_off guard; "
+                f"conditions: {_condition_names(t)}"
+            )
+
+    # ------------------------------------------------------------------
+    # start_time_callback() while override is still ON
+    # ------------------------------------------------------------------
+
+    def _setup_start_time_callback(self, model):
+        """Configure common mocks needed to call start_time_callback()."""
+        from datetime import datetime as _dt
+        fake_time = _dt(2024, 1, 1, 8, 0, 0)
+        model._start_time_private = "08:00"
+        model.parse_time = MagicMock(return_value=fake_time)
+        model.futurize = MagicMock(return_value=fake_time)
+        model.update = MagicMock()
+
+    def test_start_time_callback_stays_overridden_when_override_active(self):
+        """start_time_callback() must not drop out of overridden when override is still ON."""
+        from unittest.mock import patch as _patch
+        model = _build_model()
+        model.override()
+        assert model.state == "overridden"
+
+        model.is_override_state_on = MagicMock(return_value=True)
+        model.is_override_state_off = MagicMock(return_value=False)
+        model.is_state_entities_on = MagicMock(return_value=False)
+        model.is_state_entities_off = MagicMock(return_value=True)
+        model.is_block_enabled = MagicMock(return_value=False)
+        model.do_transition_behaviour = MagicMock()
+        self._setup_start_time_callback(model)
+
+        with _patch("custom_components.entity_controller.event.async_track_point_in_time"):
+            model.start_time_callback(MagicMock())
+
+        assert model.state == "overridden", (
+            f"Expected overridden after start_time_callback with override active, got {model.state}"
+        )
+        model.do_transition_behaviour.assert_not_called()
+
+    def test_start_time_callback_normal_flow_when_override_off(self):
+        """start_time_callback() must proceed normally when override is OFF."""
+        from unittest.mock import patch as _patch
+        model = _build_model()
+        model.constrain()
+        assert model.state == "constrained"
+
+        model.is_override_state_on = MagicMock(return_value=False)
+        model.is_override_state_off = MagicMock(return_value=True)
+        model.is_state_entities_on = MagicMock(return_value=False)
+        model.is_state_entities_off = MagicMock(return_value=True)
+        model.is_block_enabled = MagicMock(return_value=False)
+        model.do_transition_behaviour = MagicMock()
+        self._setup_start_time_callback(model)
+
+        with _patch("custom_components.entity_controller.event.async_track_point_in_time"):
+            model.start_time_callback(MagicMock())
+
+        assert model.state == "idle", (
+            f"Expected idle after start_time_callback with override OFF, got {model.state}"
+        )
+        model.do_transition_behaviour.assert_called()
