@@ -1386,9 +1386,18 @@ class Model:
         return f"{STORAGE_KEY_PREFIX}{safe_name}"
 
     def _schedule_save_state(self):
-        """Schedule an async state save without blocking the caller."""
+        """Schedule an async state save without blocking the caller.
+
+        Must be thread-safe: ``on_enter_blocked`` arms a ``threading.Timer``
+        whose ``block_timer_expire`` callback drives state transitions from a
+        worker thread, so the ``on_exit_blocked`` -> ``_schedule_save_state``
+        path is reached off the event loop. HA 2026.x raises ``RuntimeError``
+        when ``hass.async_create_task`` is called from a non-event-loop thread,
+        which aborts the transition and traps the controller in ``blocked``
+        until HA restarts.
+        """
         if self._store is not None:
-            self.hass.async_create_task(self._async_save_state())
+            asyncio.run_coroutine_threadsafe(self._async_save_state(), self.hass.loop)
 
     async def _async_save_state(self, *_args):
         """Persist the current EC state to HA storage."""

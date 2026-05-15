@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+<a name="9.8.3"></a>
+## [9.8.3](https://github.com/pluskal/entity-controller/compare/v9.8.2...v9.8.3) (2026-05-15)
+
+
+### Bug Fixes
+
+* **thread-safe `_schedule_save_state`** – Replaced `hass.async_create_task(...)` with `asyncio.run_coroutine_threadsafe(coro, hass.loop)` so the helper is safe to call from worker threads. `on_enter_blocked` arms a `threading.Timer` whose `block_timer_expire` callback drives state transitions from a worker thread, so the `on_exit_blocked` → `_schedule_save_state` path is reached off the event loop. HA 2026.x raises `RuntimeError` when `hass.async_create_task` is called from a non-event-loop thread, which aborts the transition and traps the controller in `blocked` until HA restarts. The catch-all transition added in 9.8.2 cannot rescue this case because the failure is in the exit callback itself.
+
+
+### Tests
+
+* `test_schedule_save_is_thread_safe` — regression test that invokes `_schedule_save_state` from a `threading.Thread` and asserts no exception is raised and `hass.async_create_task` is not called.
+* Updated `test_schedule_save_creates_task_when_store_set` and `test_on_enter_blocked_schedules_save` to assert against `asyncio.run_coroutine_threadsafe` instead of `hass.async_create_task`.
+
+
 <a name="9.8.2"></a>
 ## [9.8.2](https://github.com/pluskal/entity-controller/compare/v9.8.1...v9.8.2) (2026-04-07)
 

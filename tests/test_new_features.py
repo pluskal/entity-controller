@@ -658,8 +658,15 @@ class TestStatePersistence:
         m._store = MagicMock()
         m.hass = hass
         m.state = "overridden"
-        m._schedule_save_state()
-        hass.async_create_task.assert_called_once()
+        with patch(
+            "custom_components.entity_controller.asyncio.run_coroutine_threadsafe"
+        ) as schedule:
+            m._schedule_save_state()
+            schedule.assert_called_once()
+            coro, loop = schedule.call_args.args
+            assert asyncio.iscoroutine(coro)
+            coro.close()
+            assert loop is hass.loop
 
     def test_async_restore_false_when_store_none(self):
         from custom_components.entity_controller import Model
@@ -730,9 +737,42 @@ class TestStatePersistence:
         model.is_state_entities_on = MagicMock(return_value=True)
         model.is_state_entities_off = MagicMock(return_value=False)
         model.is_block_enabled = MagicMock(return_value=True)
-        model.sensor_on()
-        assert model.state == "blocked"
-        model.hass.async_create_task.assert_called()
+        with patch(
+            "custom_components.entity_controller.asyncio.run_coroutine_threadsafe"
+        ) as schedule:
+            model.sensor_on()
+            assert model.state == "blocked"
+            schedule.assert_called()
+
+    def test_schedule_save_is_thread_safe(self):
+        """Regression test: _schedule_save_state must work from a worker thread.
+
+        on_enter_blocked starts a threading.Timer whose block_timer_expire
+        callback drives on_exit_blocked from a worker thread. Calling
+        hass.async_create_task off-loop on HA 2026.x raises RuntimeError,
+        which aborts the transition and traps the controller in ``blocked``.
+        """
+        import threading
+        from custom_components.entity_controller import Model
+        hass = _make_hass()
+        m = Model.__new__(Model)
+        m.log = logging.getLogger("test")
+        m._store = MagicMock()
+        m.hass = hass
+        m.state = "blocked"
+        errors = []
+
+        def call_from_worker():
+            try:
+                m._schedule_save_state()
+            except Exception as e:  # pragma: no cover - failure path
+                errors.append(e)
+
+        t = threading.Thread(target=call_from_worker)
+        t.start()
+        t.join(timeout=2)
+        assert errors == [], f"_schedule_save_state raised from worker: {errors}"
+        hass.async_create_task.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
