@@ -44,6 +44,7 @@ from homeassistant.util import dt
 import homeassistant.util.yaml.objects as YamlObjects
 import homeassistant.util.uuid as uuid_util
 from transitions import Machine
+from transitions.core import MachineError
 from transitions.extensions import HierarchicalMachine as Machine
 from homeassistant.helpers.service import async_call_from_config
 
@@ -385,6 +386,15 @@ async def async_setup(hass, config):
     )
     # Enter blocked state when component is enabled and entity is on
     machine.add_transition(trigger="blocked", source="constrained", dest="blocked", conditions=["is_block_enabled"])
+
+    # Phase 4 fix: blocked must also be reachable from idle.
+    # start_time_callback fires while the machine is already idle (e.g. after a
+    # HA restart inside the active window, or an override toggled off before
+    # start_time) and calls blocked() when state entities are on.  Without this
+    # transition that raises MachineError, and HA keeps re-firing the failed
+    # point-in-time callback, producing an error storm (observed 2026-07-08).
+    # Mirrors the existing sensor_on: idle → blocked rule.
+    machine.add_transition(trigger="blocked", source="idle", dest="blocked", conditions=["is_block_enabled"])
 
     # Phase 1 fix: block_timer_expires → idle when state entities are already off.
     # Without this transition the SM could be stuck in blocked when entities turned
@@ -1506,13 +1516,31 @@ class Model:
 
         self.update(start_time=parsed_start)
 
-        if self.is_state_entities_on() and self.is_block_enabled():
-            self.blocked()
-        else:
-            # If the entity is on and block is disabled, we just transition from constrained
-            # to idle and leave the entity on. (Don't start a timer to turn it off.)
-            self.enable()
+        self._apply_start_time_transition()
         self.do_transition_behaviour(CONF_ON_EXIT_CONSTRAINED)
+
+    def _apply_start_time_transition(self):
+        """Transition the machine when start_time is reached.
+
+        Must never raise: an exception escaping a point-in-time callback makes
+        HA re-fire it endlessly (error storm, 2026-07-08). States with no
+        defined transition (e.g. overridden or active after a mid-window
+        restart) are logged and left unchanged — the next sensor/override
+        event resolves the controller normally.
+        """
+        try:
+            if self.is_state_entities_on() and self.is_block_enabled():
+                self.blocked()
+            else:
+                # If the entity is on and block is disabled, we just transition from constrained
+                # to idle and leave the entity on. (Don't start a timer to turn it off.)
+                self.enable()
+        except MachineError as err:
+            self.log.warning(
+                "start_time_callback :: no transition from state '%s' (%s); leaving state unchanged",
+                self.state,
+                err,
+            )
 
     # =====================================================
     #    H E L P E R   F U N C T I O N S        ( N E W )

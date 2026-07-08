@@ -174,6 +174,11 @@ def _add_machine_transitions(machine):
         trigger="blocked", source="constrained", dest="blocked",
         conditions=["is_block_enabled"],
     )
+    # Phase 4: blocked reachable from idle (start_time while already idle)
+    machine.add_transition(
+        trigger="blocked", source="idle", dest="blocked",
+        conditions=["is_block_enabled"],
+    )
     # Phase 3: force_activate bypasses all states
     machine.add_transition(
         trigger="force_activate",
@@ -961,3 +966,52 @@ class TestGracePeriod:
         assert model.state == "active_timer", (
             f"Expected active_timer (grace period suppressed), got {model.state}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 – start_time transition must not raise MachineError
+# ---------------------------------------------------------------------------
+
+class TestStartTimeTransition:
+    """Regression tests for the start_time_callback error storm (2026-07-08).
+
+    ``start_time_callback`` calls ``blocked()``/``enable()`` regardless of the
+    current machine state. When the machine was ``idle`` at start_time (HA
+    restarted inside the active window, or an override toggled off while
+    constrained) ``blocked()`` raised ``MachineError`` — and HA re-fires a
+    failed point-in-time callback endlessly, flooding the log.
+    """
+
+    def _prepare(self, state, entities_on=True, block_enabled=True):
+        model = _build_model()
+        model.state = state
+        model.is_state_entities_on = MagicMock(return_value=entities_on)
+        model.is_state_entities_off = MagicMock(return_value=not entities_on)
+        model.is_block_enabled = MagicMock(return_value=block_enabled)
+        model.is_override_state_on = MagicMock(return_value=False)
+        model.is_override_state_off = MagicMock(return_value=True)
+        return model
+
+    def test_blocked_from_idle(self):
+        """idle + entities on + block enabled → blocked, without MachineError."""
+        model = self._prepare("idle")
+        model._apply_start_time_transition()
+        assert model.state == "blocked"
+
+    def test_blocked_from_constrained_still_works(self):
+        """Existing constrained → blocked path is unchanged."""
+        model = self._prepare("constrained")
+        model._apply_start_time_transition()
+        assert model.state == "blocked"
+
+    def test_enable_from_constrained_when_entities_off(self):
+        """entities off → enable() → idle (normal start-of-window path)."""
+        model = self._prepare("constrained", entities_on=False)
+        model._apply_start_time_transition()
+        assert model.state == "idle"
+
+    def test_overridden_does_not_raise_and_keeps_state(self):
+        """No transition is defined from overridden: must log, not raise."""
+        model = self._prepare("overridden")
+        model._apply_start_time_transition()
+        assert model.state == "overridden"
