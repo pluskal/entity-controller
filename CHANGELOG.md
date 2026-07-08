@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+<a name="9.8.4"></a>
+## [9.8.4](https://github.com/pluskal/entity-controller/compare/v9.8.3...v9.8.4) (2026-07-08)
+
+
+### Bug Fixes
+
+* **state-machine** – Add `blocked` transition from `idle`. `start_time_callback` fires while the machine is already `idle` (HA restarted inside the active window, or an override toggled off while `constrained`) and calls `blocked()` when state entities are on; without the transition this raised `MachineError` and Home Assistant re-fired the failed point-in-time callback endlessly, flooding the log with tens of thousands of errors per hour (observed 2026-07-08). Mirrors the existing `sensor_on: idle → blocked` rule.
+* **`start_time_callback`** – Extract the transition into `_apply_start_time_transition()` and guard it with `try/except MachineError`. States with no defined transition at start_time (e.g. `overridden`, `active`) now log a warning and keep their state instead of raising out of the callback.
+
+### Tests
+
+* Add `TestStartTimeTransition` regression tests: `idle → blocked`, `constrained → blocked`, `constrained → idle` (entities off) and `overridden` staying unchanged without raising.
+
 <a name="9.8.3"></a>
 ## [9.8.3](https://github.com/pluskal/entity-controller/compare/v9.8.2...v9.8.3) (2026-05-15)
 
