@@ -1015,3 +1015,64 @@ class TestStartTimeTransition:
         model = self._prepare("overridden")
         model._apply_start_time_transition()
         assert model.state == "overridden"
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 – futurize() must compare in HA-local wall time, not the OS timezone
+# ---------------------------------------------------------------------------
+
+class TestFuturizeTimezone:
+    """Regression tests for the futurize() timezone bug (2026-07-09).
+
+    parse_time() returns naive times in the HA-configured timezone, but
+    futurize() compared them against datetime.now()/date.today() in the OS
+    timezone. On a host running UTC with HA on Europe/Prague, a sunrise
+    end_time callback rescheduled itself to a wall time that was future in
+    UTC terms but already past locally — async_track_point_in_time fired it
+    again immediately, in an endless turn_off loop for exactly the UTC-offset
+    window.
+    """
+
+    def _futurize_at(self, local_now, timet):
+        """Run futurize() with dt.now() mocked to a fixed HA-local instant."""
+        from zoneinfo import ZoneInfo
+        import homeassistant.util.dt as dt_util
+        prague = ZoneInfo("Europe/Prague")
+        model = _build_model()
+        previous_tz = dt_util.DEFAULT_TIME_ZONE
+        dt_util.set_default_time_zone(prague)
+        try:
+            fixed = local_now.replace(tzinfo=prague)
+            with patch(
+                "custom_components.entity_controller.dt.now",
+                return_value=fixed,
+            ):
+                return model.futurize(timet)
+        finally:
+            dt_util.set_default_time_zone(previous_tz)
+
+    def test_past_local_time_returns_tomorrow(self):
+        """05:23 local with local now 06:47 → tomorrow 05:23 (the incident case:
+        OS-UTC now was 04:47, so the old code kept it 'today' and re-fired)."""
+        from datetime import datetime as dtm, time as tm
+        result = self._futurize_at(dtm(2026, 7, 9, 6, 47, 0), tm(5, 23, 0))
+        assert result == dtm(2026, 7, 10, 5, 23, 0)
+
+    def test_future_local_time_stays_today(self):
+        from datetime import datetime as dtm, time as tm
+        result = self._futurize_at(dtm(2026, 7, 9, 6, 47, 0), tm(23, 50, 0))
+        assert result == dtm(2026, 7, 9, 23, 50, 0)
+
+    def test_past_naive_datetime_input_returns_tomorrow(self):
+        from datetime import datetime as dtm
+        result = self._futurize_at(
+            dtm(2026, 7, 9, 6, 47, 0), dtm(2026, 7, 9, 5, 23, 0)
+        )
+        assert result == dtm(2026, 7, 10, 5, 23, 0)
+
+    def test_aware_datetime_input_is_normalized(self):
+        from datetime import datetime as dtm
+        from zoneinfo import ZoneInfo
+        aware = dtm(2026, 7, 9, 5, 23, 0, tzinfo=ZoneInfo("Europe/Prague"))
+        result = self._futurize_at(dtm(2026, 7, 9, 6, 47, 0), aware)
+        assert result == dtm(2026, 7, 10, 5, 23, 0)

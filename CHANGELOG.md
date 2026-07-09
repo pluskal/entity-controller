@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+<a name="9.8.5"></a>
+## [9.8.5](https://github.com/pluskal/entity-controller/compare/v9.8.4...v9.8.5) (2026-07-09)
+
+
+### Bug Fixes
+
+* **`futurize()`** – Compare in HA-local wall time instead of the OS timezone. `parse_time()` returns naive times in the HA-configured timezone, but `futurize()` compared them against `datetime.now()`/`date.today()` in the process (OS) timezone. On a host running UTC with HA on Europe/Prague, every sunrise/sunset-relative `start_time`/`end_time` callback rescheduled itself to a wall time that was future in UTC terms but already past locally — `async_track_point_in_time` fired it again immediately, producing an endless enter/exit-constrained loop that flooded MQTT with turn_off commands (~230 msg/s) for exactly the UTC-offset window after each sun event. This, not the `MachineError` fixed in 9.8.4, was the actual driver of the 2026-07-08/09 incidents.
+
+### Tests
+
+* Add `TestFuturizeTimezone` regression tests: past/future local wall times, naive datetime input, and aware datetime normalization, with `dt.now()` pinned to a fixed HA-local instant.
+
 <a name="9.8.4"></a>
 ## [9.8.4](https://github.com/pluskal/entity-controller/compare/v9.8.3...v9.8.4) (2026-07-08)
 
