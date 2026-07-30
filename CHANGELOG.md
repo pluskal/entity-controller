@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+<a name="9.8.6"></a>
+## [9.8.6](https://github.com/pluskal/entity-controller/compare/v9.8.5...v9.8.6) (2026-07-30)
+
+
+### Bug Fixes
+
+* **state-machine** – Honour an override that was already on when `start_time` opened the window. `override_state_change()` only calls `override()` from `active`/`active_timer`/`idle`/`blocked`, mirroring the `override` trigger which has no `constrained` source — so an override switching on while the controller is still `constrained` is dropped on the floor. `_apply_start_time_transition()` then took the `blocked()` branch whenever the controlled entity happened to be on at `start_time`, and `blocked` never consults the override: once the block cleared (`block_timer_expires`, or `enable()` when the state entities went off) the machine landed in `idle` = armed, with the override forgotten. Observed on a bedroom controller whose night block is armed 6 s after `start_time` (= sunset): the room lit up on presence 7 times between 21:43 and 23:31 before it was switched off by hand. The new branch is scoped to `constrained` on purpose — `start_time_callback` also runs while already `idle` (see 9.8.4), and those states are reached only after `override_state_change()` has had its chance, so they keep the original behaviour. `overridden_by`/`overridden_at` are set to match the normal override path.
+
+### Tests
+
+* Add `TestStartTimeOverride` regression tests: override on with state entities on (the fix) and off, no override entities configured, overrides configured but off, the `idle` path staying on `blocked`, and the `overridden_by`/`overridden_at` bookkeeping.
+
 <a name="9.8.5"></a>
 ## [9.8.5](https://github.com/pluskal/entity-controller/compare/v9.8.4...v9.8.5) (2026-07-09)
 
