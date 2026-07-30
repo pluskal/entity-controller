@@ -1076,3 +1076,85 @@ class TestFuturizeTimezone:
         aware = dtm(2026, 7, 9, 5, 23, 0, tzinfo=ZoneInfo("Europe/Prague"))
         result = self._futurize_at(dtm(2026, 7, 9, 6, 47, 0), aware)
         assert result == dtm(2026, 7, 10, 5, 23, 0)
+
+
+# ---------------------------------------------------------------------------
+# Override at start_time — an override armed while constrained must survive
+# ---------------------------------------------------------------------------
+
+class TestStartTimeOverride:
+    """Regression tests for the override lost at start_time (2026-07-29).
+
+    ``override_state_change()`` only calls ``override()`` from
+    active/active_timer/idle/blocked — mirroring the ``override`` trigger,
+    which has no ``constrained`` source — so an override switching on while
+    the controller is still ``constrained`` is dropped. When the controlled
+    entity then happened to be on at ``start_time``, ``_apply_start_time_transition``
+    took the ``blocked()`` branch, which never consults the override; once the
+    block cleared the machine landed in ``idle`` = armed, and the room lit up
+    on presence all night (observed on ec_202, 7 times between 21:43 and 23:31).
+    """
+
+    def _prepare(self, state, entities_on=True, override_on=True,
+                 overrides=("input_boolean.disable_ec_test",), block_enabled=True):
+        model = _build_model()
+        model.state = state
+        model.overrideEntities = list(overrides)
+        model.is_state_entities_on = MagicMock(return_value=entities_on)
+        model.is_state_entities_off = MagicMock(return_value=not entities_on)
+        model.is_block_enabled = MagicMock(return_value=block_enabled)
+        model.is_override_state_on = MagicMock(return_value=override_on)
+        model.is_override_state_off = MagicMock(return_value=not override_on)
+        model._override_entity_state = MagicMock(
+            return_value=list(overrides)[0] if (override_on and overrides) else None
+        )
+        return model
+
+    def test_override_on_with_entities_on_goes_overridden(self):
+        """THE FIX: constrained + override on + entities on → overridden, not blocked."""
+        model = self._prepare("constrained", entities_on=True)
+        model._apply_start_time_transition()
+        assert model.state == "overridden", (
+            f"override was armed while constrained but landed in {model.state}"
+        )
+
+    def test_override_on_with_entities_off_still_overridden(self):
+        """Path that already worked before the fix must be unaffected."""
+        model = self._prepare("constrained", entities_on=False)
+        model._apply_start_time_transition()
+        assert model.state == "overridden"
+
+    def test_no_override_entities_configured_still_blocks(self):
+        """A controller without overrides must keep the original behaviour."""
+        model = self._prepare("constrained", entities_on=True, override_on=False,
+                              overrides=())
+        model._apply_start_time_transition()
+        assert model.state == "blocked"
+
+    def test_override_off_still_blocks(self):
+        """Overrides configured but all off → original blocked path."""
+        model = self._prepare("constrained", entities_on=True, override_on=False)
+        model._apply_start_time_transition()
+        assert model.state == "blocked"
+
+    def test_override_on_from_idle_keeps_original_path(self):
+        """The new branch is scoped to `constrained` on purpose.
+
+        start_time_callback also runs while already idle (see Phase 4); those
+        states are reached only after override_state_change() has had its
+        chance, so they must keep the idle → blocked behaviour.
+        """
+        model = self._prepare("idle", entities_on=True)
+        model._apply_start_time_transition()
+        assert model.state == "blocked"
+
+    def test_overridden_by_and_at_are_recorded(self):
+        """Attributes must match what override_state_change() would have set."""
+        model = self._prepare("constrained", entities_on=True)
+        model.update = MagicMock(wraps=model.update)
+        model._apply_start_time_transition()
+        keys = {}
+        for call in model.update.call_args_list:
+            keys.update(call.kwargs)
+        assert keys.get("overridden_by") == "input_boolean.disable_ec_test"
+        assert "overridden_at" in keys

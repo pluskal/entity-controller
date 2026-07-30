@@ -1529,7 +1529,34 @@ class Model:
         event resolves the controller normally.
         """
         try:
-            if self.is_state_entities_on() and self.is_block_enabled():
+            # Override-at-start_time fix (2026-07-30): an override that switched
+            # on while we were still constrained never reached the machine.
+            # override_state_change()
+            # only calls override() from active/active_timer/idle/blocked --
+            # matching the `override` trigger, which has no `constrained`
+            # source -- so the event is dropped on the floor.  Without this
+            # branch the blocked() path below then strands the controller:
+            # blocked ignores the override entirely, and when the block clears
+            # (block_timer_expires, or enable() once the state entities go off)
+            # the machine lands in idle = armed, with the override forgotten.
+            # Observed 2026-07-29 on ec_202: the night block was armed 6s after
+            # start_time (= sunset) while the controlled light happened to be
+            # on, and the room then lit up on presence 7 times during the night.
+            # enable() has a dedicated constrained -> overridden transition, so
+            # routing through it honours the override without a new transition.
+            # Scoped to `constrained` on purpose: start_time_callback also runs
+            # while already idle/blocked/etc. (see the Phase 4 comment above),
+            # and those states are reached only after override_state_change()
+            # has had its chance, so they must keep the original behaviour.
+            if (
+                self.is_constrained()
+                and len(self.overrideEntities) > 0
+                and self.is_override_state_on()
+            ):
+                self.update(overridden_by=self._override_entity_state())
+                self.enable()
+                self.update(overridden_at=str(datetime.now()))
+            elif self.is_state_entities_on() and self.is_block_enabled():
                 self.blocked()
             else:
                 # If the entity is on and block is disabled, we just transition from constrained
