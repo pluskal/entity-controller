@@ -76,18 +76,29 @@ entity_controller:
 
 Cancel callbacks are tracked automatically and cleaned up whenever the configuration is refreshed.
 
-## Lux Constraint (`lux_entity` / `lux_threshold`)
+## Lux Constraint (`lux_entity` / `lux_threshold` / `lux_bright_states`)
 
-Gate activation on measured room illuminance: when both keys are set, motion turns the lights on **only while the reading is below `lux_threshold`** (in whatever unit the sensor reports, typically lx). Walking into an already-bright room no longer switches the lights on.
+Gate activation on measured room illuminance: motion turns the lights on **only while the room is dark enough**. Walking into an already-bright room no longer switches the lights on. Two sensor flavours are supported on the same `lux_entity`:
+
+- **numeric sensors** (PIR-style lux): activation requires reading < `lux_threshold` (in whatever unit the sensor reports, typically lx);
+- **string sensors** (radar/mmWave two-level `bright`/`dim`): activation is blocked while the state matches one of `lux_bright_states` — the light-level calibration lives in the sensor's own firmware.
 
 ```yaml
 entity_controller:
-  bedroom:
+  bedroom:                                  # numeric PIR lux
     sensor: binary_sensor.bedroom_occupancy
     entity: light.bedroom_led_strip
     lux_entity: sensor.bedroom_illuminance
-    lux_threshold: 50    # activate only below 50 lx
+    lux_threshold: 50                       # activate only below 50 lx
+
+  living_room:                              # radar bright/dim
+    sensor: binary_sensor.living_room_presence
+    entity: light.living_room_wall
+    lux_entity: sensor.living_room_presence_illumination
+    lux_bright_states: ["bright"]
 ```
+
+Both keys may be combined on one entity: numeric readings compare against the threshold, string states match the list.
 
 The constraint deliberately gates **only** the `idle → active` transition that starts from a fully-off room. Everything else is unaffected:
 
@@ -95,7 +106,7 @@ The constraint deliberately gates **only** the `idle → active` transition that
 - the `blocked` bookkeeping paths (lights already on);
 - `overrides`, `forced_sensors`, and the `activate` service (manual escape hatch).
 
-A lux entity that is `unavailable`, missing, or non-numeric **fails open**: activation is allowed and a warning is logged. A dead sensor battery degrades to pre-lux behaviour instead of leaving the room dark. Setting only one of the two keys logs an error and disables the constraint.
+A lux entity that is `unavailable`, missing, or otherwise unmatched (numeric on a bright-states-only config, or a string not in the list) **fails open**: activation is allowed and a warning is logged where appropriate. A dead sensor battery degrades to pre-lux behaviour instead of leaving the room dark. Setting `lux_entity` without any criterion — or a criterion without `lux_entity` — logs an error and disables the constraint.
 
 When an activation is blocked, the EC entity records `lux_blocked_at` and `lux_at_last_block` attributes for diagnostics; `lux_entity` and `lux_threshold` are always shown as attributes when the constraint is active.
 
