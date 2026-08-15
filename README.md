@@ -76,6 +76,29 @@ entity_controller:
 
 Cancel callbacks are tracked automatically and cleaned up whenever the configuration is refreshed.
 
+## Lux Constraint (`lux_entity` / `lux_threshold`)
+
+Gate activation on measured room illuminance: when both keys are set, motion turns the lights on **only while the reading is below `lux_threshold`** (in whatever unit the sensor reports, typically lx). Walking into an already-bright room no longer switches the lights on.
+
+```yaml
+entity_controller:
+  bedroom:
+    sensor: binary_sensor.bedroom_occupancy
+    entity: light.bedroom_led_strip
+    lux_entity: sensor.bedroom_illuminance
+    lux_threshold: 50    # activate only below 50 lx
+```
+
+The constraint deliberately gates **only** the `idle → active` transition that starts from a fully-off room. Everything else is unaffected:
+
+- **timer resets** while active — the controlled light inflates the reading itself, so re-triggers must not be gated (otherwise the light would drop out mid-presence);
+- the `blocked` bookkeeping paths (lights already on);
+- `overrides`, `forced_sensors`, and the `activate` service (manual escape hatch).
+
+A lux entity that is `unavailable`, missing, or non-numeric **fails open**: activation is allowed and a warning is logged. A dead sensor battery degrades to pre-lux behaviour instead of leaving the room dark. Setting only one of the two keys logs an error and disables the constraint.
+
+When an activation is blocked, the EC entity records `lux_blocked_at` and `lux_at_last_block` attributes for diagnostics; `lux_entity` and `lux_threshold` are always shown as attributes when the constraint is active.
+
 ## State Persistence
 
 EC now persists the `overridden` and `blocked` states across Home Assistant restarts using the built-in HA storage layer. On startup the saved state is re-validated against the current live entity states before being applied, so stale persisted states are silently discarded.

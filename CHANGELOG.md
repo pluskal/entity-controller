@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+<a name="9.8.7"></a>
+## [9.8.7](https://github.com/pluskal/entity-controller/compare/v9.8.6...v9.8.7) (2026-08-15)
+
+
+### Features
+
+* **lux-constraint** – New `lux_entity` + `lux_threshold` options gate activation on measured room illuminance: `sensor_on` turns the lights on from `idle` only while the reading is below the threshold, so walking into an already-bright room no longer switches the lights on. Scoped deliberately to the single `idle → active` transition that starts from a fully-off room — timer resets while active, the `blocked` paths, overrides, `forced_sensors`, and the `activate` service are untouched, so the controlled light inflating the reading can never drop a running controller mid-presence, and manual activation always works. A missing, `unavailable`, or non-numeric lux entity fails open (activation allowed, warning logged): a dead sensor battery degrades to pre-lux behaviour instead of a permanently dark room. Setting only one of the two keys logs an error and disables the constraint. Blocked activations record `lux_blocked_at`/`lux_at_last_block` attributes; `lux_entity`/`lux_threshold` are surfaced as entity attributes while the constraint is active.
+
+### Tests
+
+* Add `TestLuxConstraint` (15 tests): activation allowed below / blocked at-and-above the threshold, inclusive boundary, no-config passthrough, fail-open on unavailable and missing lux entities, timer-reset and blocked paths not gated, `activate`/`force_activate` bypass, diagnostic attributes, partial-config validation, and machine-level condition placement.
+
 <a name="9.8.6"></a>
 ## [9.8.6](https://github.com/pluskal/entity-controller/compare/v9.8.5...v9.8.6) (2026-07-30)
 
