@@ -265,6 +265,11 @@ def _build_model(hass=None, entity=None, config=None):
         m.luxEntity = None
         m.lux_threshold = None
         m.lux_bright_states = []
+        m.night_mode_entity = None
+        m.night_mode_entity_states = []
+        m.nightControlEntities = []
+        m.activeControlEntities = []
+        m._state_entities_explicit = False
         m.disable_block = False
         m.block_timeout = None
         m.grace_period = None
@@ -1410,3 +1415,210 @@ class TestLuxBrightStates:
         model.config_lux_constraint({"lux_bright_states": ["bright"]})
         assert model.lux_bright_states == []
         assert model.is_lux_constraint_satisfied() is True
+
+
+# ---------------------------------------------------------------------------
+# Night mode: entity-state-driven detection + alternate control entities
+# ---------------------------------------------------------------------------
+
+class TestNightModeEntity:
+    """night_mode.entity/entity_states/entities (state-driven night mode)."""
+
+    def _prepare(self, mode_state="noc", night_states=("vecerka", "noc"),
+                 night_entities=("light.bed",), window=None):
+        model = _build_model()
+        model.controlEntities = ["light.downlights"]
+        model.night_mode = {"delay": 120}
+        if window:
+            model.night_mode["start_time"] = window[0]
+            model.night_mode["end_time"] = window[1]
+        model.night_mode_entity = "input_select.house_mode"
+        model.night_mode_entity_states = list(night_states)
+        model.nightControlEntities = list(night_entities)
+        model.light_params_night = {
+            "delay": 120, "service_data": None, "service_data_off": None,
+        }
+        state_obj = MagicMock()
+        state_obj.state = mode_state
+        model.hass.states.get = MagicMock(return_value=state_obj)
+        return model
+
+    # --- is_night ---------------------------------------------------------
+
+    def test_no_night_mode_is_never_night(self):
+        model = _build_model()
+        assert model.is_night() is False
+
+    def test_entity_state_in_states_is_night(self):
+        model = self._prepare("noc")
+        assert model.is_night() is True
+
+    def test_entity_state_vecerka_is_night(self):
+        model = self._prepare("vecerka")
+        assert model.is_night() is True
+
+    def test_entity_state_not_in_states_is_day(self):
+        model = self._prepare("vecer")
+        assert model.is_night() is False
+
+    def test_missing_entity_fails_open_to_day(self):
+        model = self._prepare("noc")
+        model.hass.states.get = MagicMock(return_value=None)
+        assert model.is_night() is False
+
+    def test_entity_day_but_time_window_says_night(self):
+        """Entity and window coexist: whichever says night wins."""
+        model = self._prepare("vecer", window=("22:00:00", "06:00:00"))
+        model.now_is_between = MagicMock(return_value=True)
+        assert model.is_night() is True
+
+    def test_entity_night_short_circuits_window(self):
+        model = self._prepare("noc", window=("22:00:00", "06:00:00"))
+        model.now_is_between = MagicMock(return_value=False)
+        assert model.is_night() is True
+
+    # --- prepare_service_data / entity switching ---------------------------
+
+    def test_night_activation_targets_night_entities(self):
+        model = self._prepare("noc")
+        model.prepare_service_data()
+        assert model.activeControlEntities == ["light.bed"]
+        assert model.lightParams is model.light_params_night
+
+    def test_day_activation_targets_control_entities(self):
+        model = self._prepare("vecer")
+        model.prepare_service_data()
+        assert model.activeControlEntities == ["light.downlights"]
+        assert model.lightParams is model.light_params_day
+
+    def test_night_without_night_entities_falls_back(self):
+        model = self._prepare("noc", night_entities=())
+        model.prepare_service_data()
+        assert model.activeControlEntities == ["light.downlights"]
+
+    def test_turn_on_calls_night_entities_only(self):
+        model = self._prepare("noc")
+        model.prepare_service_data()
+        model.call_service = MagicMock()
+        model.turn_on_control_entities()
+        called = [c.args[0] for c in model.call_service.call_args_list]
+        assert called == ["light.bed"]
+
+    def test_turn_off_uses_set_chosen_at_activation(self):
+        """Mode flip between activation and timeout must not orphan lights."""
+        model = self._prepare("noc")
+        model.prepare_service_data()  # activates with night set
+        state_obj = MagicMock()
+        state_obj.state = "den"  # house mode flips before the timer expires
+        model.hass.states.get = MagicMock(return_value=state_obj)
+        model.call_service = MagicMock()
+        model.turn_off_control_entities()
+        called = [c.args[0] for c in model.call_service.call_args_list]
+        assert called == ["light.bed"]
+
+    def test_empty_active_set_falls_back_to_control_entities(self):
+        model = self._prepare("noc")
+        model.activeControlEntities = []
+        model.call_service = MagicMock()
+        model.turn_on_control_entities()
+        called = [c.args[0] for c in model.call_service.call_args_list]
+        assert called == ["light.downlights"]
+
+    # --- config_night_mode --------------------------------------------------
+
+    def _config(self, model, night_mode):
+        with patch(
+            "custom_components.entity_controller.event.async_track_state_change_event"
+        ) as track:
+            model.config_night_mode({"night_mode": night_mode})
+        return track
+
+    def test_config_entity_mode_valid_without_window(self):
+        model = _build_model()
+        model.light_params_day = {"delay": 180, "service_data": None,
+                                  "service_data_off": None}
+        self._config(model, {
+            "entity": "input_select.house_mode",
+            "entity_states": ["vecerka", "noc"],
+            "entities": ["light.bed"],
+        })
+        assert model.night_mode is not None
+        assert model.night_mode_entity == "input_select.house_mode"
+        assert model.nightControlEntities == ["light.bed"]
+
+    def test_config_entity_without_states_disables(self):
+        model = _build_model()
+        model.light_params_day = {"delay": 180, "service_data": None,
+                                  "service_data_off": None}
+        self._config(model, {"entity": "input_select.house_mode"})
+        assert model.night_mode is None
+        assert model.is_night() is False
+
+    def test_config_neither_window_nor_entity_disables(self):
+        model = _build_model()
+        model.light_params_day = {"delay": 180, "service_data": None,
+                                  "service_data_off": None}
+        self._config(model, {"delay": 60})
+        assert model.night_mode is None
+
+    def test_config_time_window_still_works(self):
+        model = _build_model()
+        model.light_params_day = {"delay": 180, "service_data": None,
+                                  "service_data_off": None}
+        self._config(model, {"start_time": "22:00:00",
+                             "end_time": "06:00:00"})
+        assert model.night_mode is not None
+        assert model.night_mode_entity is None
+
+    def test_config_night_entities_join_default_state_entities(self):
+        model = _build_model()
+        model.light_params_day = {"delay": 180, "service_data": None,
+                                  "service_data_off": None}
+        model.controlEntities = ["light.downlights"]
+        model.stateEntities = ["light.downlights"]
+        model._state_entities_explicit = False
+        track = self._config(model, {
+            "entity": "input_select.house_mode",
+            "entity_states": ["noc"],
+            "entities": ["light.bed"],
+        })
+        assert "light.bed" in model.stateEntities
+        assert track.called
+
+    def test_config_explicit_state_entities_not_extended(self):
+        model = _build_model()
+        model.light_params_day = {"delay": 180, "service_data": None,
+                                  "service_data_off": None}
+        model.controlEntities = ["light.downlights"]
+        model.stateEntities = ["sensor.custom"]
+        model._state_entities_explicit = True
+        track = self._config(model, {
+            "entity": "input_select.house_mode",
+            "entity_states": ["noc"],
+            "entities": ["light.bed"],
+        })
+        assert model.stateEntities == ["sensor.custom"]
+        assert not track.called
+
+    # --- schema -------------------------------------------------------------
+
+    def test_schema_entity_only_valid(self):
+        from custom_components.entity_controller import MODE_SCHEMA
+        conf = MODE_SCHEMA({
+            "entity": "input_select.house_mode",
+            "entity_states": ["vecerka", "noc"],
+            "entities": ["light.bed"],
+        })
+        assert conf["entity"] == "input_select.house_mode"
+
+    def test_schema_time_only_valid(self):
+        from custom_components.entity_controller import MODE_SCHEMA
+        conf = MODE_SCHEMA({"start_time": "22:00:00",
+                            "end_time": "06:00:00"})
+        assert conf["start_time"] == "22:00:00"
+
+    def test_schema_neither_invalid(self):
+        import voluptuous as vol
+        from custom_components.entity_controller import MODE_SCHEMA
+        with pytest.raises(vol.Invalid):
+            MODE_SCHEMA({"delay": 60})

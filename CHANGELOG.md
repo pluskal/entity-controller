@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+<a name="9.8.9"></a>
+## [9.8.9](https://github.com/pluskal/entity-controller/compare/v9.8.8...v9.8.9) (2026-08-15)
+
+
+### Features
+
+* **night-mode** – `night_mode` can now be driven by the state of an entity (`entity` + `entity_states`, e.g. a house-mode `input_select`) instead of — or in addition to — the fixed `start_time`/`end_time` window; whichever source says "night" wins, and a missing mode entity fails open to day behaviour. A new `entities` sub-key swaps the controller's target set while night mode is active (e.g. bed LED instead of downlights); the set is chosen at activation and remembered, so a mode flip mid-timer never orphans a light. Night targets are observed as state entities unless `state_entities` is explicit.
+
+### Bug Fixes
+
+* **schema** – `MODE_SCHEMA`'s `service_data`/`service_data_off` defaults (`None`) crashed under current voluptuous, which validates inserted defaults (`Coerce(dict)` on `None` always fails); guarded with `vol.Any(None, ...)`. Latent only: HA never applies the component's `PLATFORM_SCHEMA`, but the schema is now usable in tests and any future validation.
+
+### Tests
+
+* Add `TestNightModeEntity` (22 tests): entity-driven night detection (match/non-match/missing entity/coexisting time window), activation-time target selection incl. mid-timer mode flips and empty-set fallbacks, `config_night_mode` validation permutations, state-entity extension rules, and MODE_SCHEMA validation.
+
 <a name="9.8.8"></a>
 ## [9.8.8](https://github.com/pluskal/entity-controller/compare/v9.8.7...v9.8.8) (2026-08-15)
 

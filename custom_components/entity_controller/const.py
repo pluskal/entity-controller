@@ -91,6 +91,10 @@ CONF_SENSOR_TYPE_DURATION = "sensor_type_duration"
 CONF_SENSOR_TYPE = "sensor_type"
 CONF_SENSOR_RESETS_TIMER = "sensor_resets_timer"
 CONF_NIGHT_MODE = "night_mode"
+# night_mode sub-keys: state-entity-driven night detection + alternate targets
+CONF_NIGHT_MODE_ENTITY = "entity"
+CONF_NIGHT_MODE_ENTITY_STATES = "entity_states"
+CONF_NIGHT_MODE_ENTITIES = "entities"
 CONF_STATE_ATTRIBUTES_IGNORE = "state_attributes_ignore"
 CONF_IGNORED_EVENT_SOURCES = "ignored_event_sources"
 MODE_DAY = 'day'

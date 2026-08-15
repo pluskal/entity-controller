@@ -110,6 +110,45 @@ A lux entity that is `unavailable`, missing, or otherwise unmatched (numeric on 
 
 When an activation is blocked, the EC entity records `lux_blocked_at` and `lux_at_last_block` attributes for diagnostics; `lux_entity` and `lux_threshold` are always shown as attributes when the constraint is active.
 
+## Entity-Driven Night Mode (`night_mode: entity` / `entity_states` / `entities`)
+
+`night_mode` historically switched to alternate service parameters (dimmer
+brightness, shorter delay) inside a fixed time window. It can now also be
+driven by the **state of an entity** — typically a house-mode
+`input_select` — and can swap the **target entities** themselves:
+
+```yaml
+entity_controller:
+  ec_bedroom:
+    sensors:
+      - binary_sensor.bedroom_motion
+    entities:
+      - light.bedroom_wardrobe       # day/evening target
+    night_mode:
+      entity: input_select.house_mode
+      entity_states: [vecerka, noc]  # these states mean "night"
+      entities:
+        - light.bedroom_bed          # night target replaces the day set
+      delay: 120
+```
+
+Semantics:
+
+- `entity` + `entity_states` declare night whenever the entity's state matches
+  one of the listed strings. `start_time`/`end_time` are now optional; if both
+  a window and an entity are configured, **whichever says night wins**.
+  At least one of `entity` / `start_time` must be present.
+- `entities` (optional) replaces the controller's target set while night mode
+  is active. The set is chosen **at activation time** and remembered: if the
+  mode flips while the timer runs, the eventual turn-off still targets
+  whatever was turned on — no orphaned lights.
+- Night targets are watched like state entities (unless `state_entities` is
+  set explicitly), so a manually-lit night light blocks activation as usual.
+- A missing/unavailable mode entity **fails open to day behaviour** — a broken
+  helper skips the night tweaks, it never dims the house.
+- `mode` (day/night) and `active_entities` attributes expose the current
+  choice for diagnostics.
+
 ## State Persistence
 
 EC now persists the `overridden` and `blocked` states across Home Assistant restarts using the built-in HA storage layer. On startup the saved state is re-validated against the current live entity states before being applied, so stale persisted states are silently discarded.
