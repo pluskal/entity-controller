@@ -99,6 +99,9 @@ from .const import (
     CONF_SENSOR_TYPE,
     CONF_SENSOR_RESETS_TIMER,
     CONF_NIGHT_MODE,
+    CONF_NIGHT_MODE_ENTITY,
+    CONF_NIGHT_MODE_ENTITY_STATES,
+    CONF_NIGHT_MODE_ENTITIES,
     CONF_STATE_ATTRIBUTES_IGNORE,
     CONF_IGNORED_EVENT_SOURCES,
     CONSTRAIN_START,
@@ -135,15 +138,29 @@ STARTUP_DELAY = 70
 
 devices = []
 MODE_SCHEMA = vol.Schema(
-    {
-        vol.Optional(CONF_SERVICE_DATA, default=None): vol.Coerce(
-            dict
-        ),  # Default must be none because we differentiate between set and unset
-        vol.Optional(CONF_SERVICE_DATA_OFF, default=None): vol.Coerce(dict),
-        vol.Required(CONF_START_TIME): cv.string,
-        vol.Required(CONF_END_TIME): cv.string,
-        vol.Optional(CONF_DELAY, default=DEFAULT_DELAY): cv.positive_int,
-    }
+    vol.All(
+        {
+            # Default must be None because we differentiate between set and
+            # unset. Guarded by vol.Any: current voluptuous validates inserted
+            # defaults, and Coerce(dict) on None always fails.
+            vol.Optional(CONF_SERVICE_DATA, default=None): vol.Any(
+                None, vol.Coerce(dict)
+            ),
+            vol.Optional(CONF_SERVICE_DATA_OFF, default=None): vol.Any(
+                None, vol.Coerce(dict)
+            ),
+            vol.Optional(CONF_START_TIME): cv.string,
+            vol.Optional(CONF_END_TIME): cv.string,
+            vol.Optional(CONF_NIGHT_MODE_ENTITY): cv.entity_id,
+            vol.Optional(CONF_NIGHT_MODE_ENTITY_STATES, default=[]): vol.All(
+                cv.ensure_list, [cv.string]
+            ),
+            vol.Optional(CONF_NIGHT_MODE_ENTITIES, default=[]): cv.entity_ids,
+            vol.Optional(CONF_DELAY, default=DEFAULT_DELAY): cv.positive_int,
+        },
+        # night detection needs a time window, a state entity, or both
+        cv.has_at_least_one_key(CONF_NIGHT_MODE_ENTITY, CONF_START_TIME),
+    )
 )
 
 ENTITY_SCHEMA = vol.Schema(
@@ -613,6 +630,13 @@ class Model:
         self.luxEntity = None
         self.lux_threshold = None
         self.lux_bright_states = []
+        self.night_mode_entity = None
+        self.night_mode_entity_states = []
+        self.nightControlEntities = []
+        # the target set chosen at the most recent activation; turn-off must
+        # use the same set even if day/night flipped while the timer ran
+        self.activeControlEntities = []
+        self._state_entities_explicit = False
 
         self.log.debug(
             "Initialising EntityController entity with this configuration: "
@@ -1090,11 +1114,37 @@ class Model:
     def is_night(self):
         if self.night_mode is None:
             return False  # if night mode is undefined, it's never night :)
-        else:
-            self.log.debug("NIGHT MODE ENABLED: " + str(self.night_mode))
+
+        self.log.debug("NIGHT MODE ENABLED: " + str(self.night_mode))
+
+        # state-entity-driven night detection (e.g. input_select.house_mode);
+        # an unavailable/missing entity fails open to DAY behaviour — a broken
+        # helper must never dim the house, only skip the night tweaks
+        if self.night_mode_entity is not None:
+            s = self.hass.states.get(self.night_mode_entity)
+            state = getattr(s, "state", None)
+            if state is None:
+                self.log.warning(
+                    "is_night :: night_mode entity %s does not exist; treating as day.",
+                    self.night_mode_entity,
+                )
+            elif state in self.night_mode_entity_states:
+                self.log.debug(
+                    "is_night :: %s is '%s' (in entity_states) -> night.",
+                    self.night_mode_entity,
+                    state,
+                )
+                return True
+
+        # time-window detection (original behaviour); may coexist with the
+        # entity above — whichever says "night" wins
+        if self.night_mode.get(CONF_START_TIME) and self.night_mode.get(
+            CONF_END_TIME
+        ):
             return self.now_is_between(
                 self.night_mode[CONF_START_TIME], self.night_mode[CONF_END_TIME]
             )
+        return False
 
     def is_event_sensor(self):
         return self.sensor_type == SENSOR_TYPE_EVENT
@@ -1216,6 +1266,7 @@ class Model:
         self.add(
             self.stateEntities, config, CONF_STATE_ENTITIES
         )  # adding optimistically
+        self._state_entities_explicit = len(self.stateEntities) > 0
         if len(self.stateEntities) > 0:  # now checking whether they actually exist
             self.log.info(
                 "State Entities (explicitly defined - I hope you know what you are doing): " + str(self.stateEntities)
@@ -1351,11 +1402,51 @@ class Model:
                 CONF_SERVICE_DATA_OFF, self.light_params_day.get(CONF_SERVICE_DATA_OFF)
             )
 
-            if not "start_time" in night_mode:
-                self.log.error("Night mode requires a start_time parameter !")
+            self.night_mode_entity = night_mode.get(CONF_NIGHT_MODE_ENTITY)
+            self.night_mode_entity_states = night_mode.get(
+                CONF_NIGHT_MODE_ENTITY_STATES, []
+            )
+            self.nightControlEntities = night_mode.get(CONF_NIGHT_MODE_ENTITIES, [])
 
-            if not "end_time" in night_mode:
-                self.log.error("Night mode requires a end_time parameter !")
+            has_window = "start_time" in night_mode and "end_time" in night_mode
+            if self.night_mode_entity is not None and not self.night_mode_entity_states:
+                self.log.error(
+                    "Night mode 'entity' requires 'entity_states' (list of states that mean night). Disabling night mode."
+                )
+                self.night_mode = None
+                self.night_mode_entity = None
+                self.nightControlEntities = []
+                return
+            if self.night_mode_entity is None and not has_window:
+                self.log.error(
+                    "Night mode requires either start_time+end_time or entity+entity_states! Disabling night mode."
+                )
+                self.night_mode = None
+                self.nightControlEntities = []
+                return
+
+            if self.nightControlEntities:
+                self.log.info(
+                    "Night Control Entities: %s", str(self.nightControlEntities)
+                )
+                # observe night targets like any other state entity so a
+                # manually-lit night light blocks activation and external
+                # changes are noticed — but only when state entities were
+                # defaulted from control entities, never when set explicitly
+                if not self._state_entities_explicit:
+                    new_watch = [
+                        e for e in self.nightControlEntities
+                        if e not in self.stateEntities
+                    ]
+                    if new_watch:
+                        self.stateEntities.extend(new_watch)
+                        event.async_track_state_change_event(
+                            self.hass, new_watch, self.state_entity_state_change
+                        )
+                        self.log.debug(
+                            "Added night control entities as state entities: %s",
+                            str(new_watch),
+                        )
 
     def config_state_attributes_ignore(self, config):
         self.add(self.ignored_event_sources, config, CONF_IGNORED_EVENT_SOURCES)
@@ -1752,7 +1843,7 @@ class Model:
     def turn_on_control_entities(self):
         self.handleTriggerOnActivateEntities()
 
-        for e in self.controlEntities:
+        for e in self.activeControlEntities or self.controlEntities:
             # if light params are defined
             if self.lightParams.get(CONF_SERVICE_DATA) is not None:
                 self.log.debug(
@@ -1771,7 +1862,7 @@ class Model:
 
     def turn_off_control_entities(self):
         self.handleTriggerOnDeactivateEntities()
-        for e in self.controlEntities:
+        for e in self.activeControlEntities or self.controlEntities:
             self.log.debug("turn_off_control_entities :: Turning off %s", e)
 
             if self.lightParams.get(CONF_SERVICE_DATA_OFF) is not None:
@@ -2000,12 +2091,18 @@ class Model:
                 "Using NIGHT MODE parameters: " + str(self.light_params_night)
             )
             self.lightParams = self.light_params_night
+            self.activeControlEntities = (
+                self.nightControlEntities or self.controlEntities
+            )
             self.update(mode=MODE_NIGHT)
         else:
             self.log.debug("Using DAY MODE parameters: " + str(self.light_params_day))
             self.lightParams = self.light_params_day
+            self.activeControlEntities = self.controlEntities
             if self.night_mode is not None:
                 self.update(mode=MODE_DAY)  # only show when night mode set up
+        if self.nightControlEntities:
+            self.update(active_entities=list(self.activeControlEntities))
         self.update(delay=self.lightParams.get(CONF_DELAY))
 
     def call_service(self, entity, service, **service_data):
@@ -2223,6 +2320,9 @@ class Model:
         self.log.debug("Lux Entity:             %s", str(self.luxEntity))
         self.log.debug("Lux Threshold:          %s", str(self.lux_threshold))
         self.log.debug("Lux Bright States:      %s", str(self.lux_bright_states))
+        self.log.debug("Night Mode Entity:      %s", str(self.night_mode_entity))
+        self.log.debug("Night Mode States:      %s", str(self.night_mode_entity_states))
+        self.log.debug("Night Control Entities: %s", str(self.nightControlEntities))
         self.log.debug("Light params:           %s", str(self.lightParams))
         self.log.debug("        -------        Time        -------        ")
         self.log.debug("Start time:             %s", self._start_time_private)
