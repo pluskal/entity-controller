@@ -35,6 +35,10 @@ CONF_FORCED_SENSORS = "forced_sensors"
 CONF_EVENT_SENSORS = "event_sensors"
 CONF_EVENT_SENSOR_TYPE = "ha_event"  # sensor_type value for HA bus events
 
+# Illuminance (lux) activation constraint
+CONF_LUX_ENTITY = "lux_entity"
+CONF_LUX_THRESHOLD = "lux_threshold"
+
 # State persistence
 STORAGE_VERSION = 1
 STORAGE_KEY_PREFIX = "entity_controller_state_"

@@ -58,7 +58,7 @@ def _add_machine_transitions(machine):
     )
     machine.add_transition(
         trigger="sensor_on", source="idle", dest="active",
-        conditions=["is_state_entities_off"],
+        conditions=["is_state_entities_off", "is_lux_constraint_satisfied"],
     )
     machine.add_transition(
         trigger="sensor_on", source="idle", dest="active",
@@ -262,6 +262,8 @@ def _build_model(hass=None, entity=None, config=None):
         m.ignored_event_sources = []
         m.context = None
         m._store = None
+        m.luxEntity = None
+        m.lux_threshold = None
         m.disable_block = False
         m.block_timeout = None
         m.grace_period = None
@@ -1158,3 +1160,169 @@ class TestStartTimeOverride:
             keys.update(call.kwargs)
         assert keys.get("overridden_by") == "input_boolean.disable_ec_test"
         assert "overridden_at" in keys
+
+
+# ---------------------------------------------------------------------------
+# Lux constraint — illuminance-gated activation
+# ---------------------------------------------------------------------------
+
+class TestLuxConstraint:
+
+    def _prepare(self, lux_state=None, threshold=100.0):
+        """Model in idle with entities off; lux entity configured when
+        lux_state is not None."""
+        model = _build_model()
+        model.is_state_entities_on = MagicMock(return_value=False)
+        model.is_state_entities_off = MagicMock(return_value=True)
+        if lux_state is not None:
+            model.luxEntity = "sensor.test_illuminance"
+            model.lux_threshold = threshold
+            state_obj = MagicMock()
+            state_obj.state = lux_state
+            model.hass.states.get = MagicMock(return_value=state_obj)
+        return model
+
+    def test_activation_allowed_when_dark(self):
+        """Below the threshold the original idle → active path must fire."""
+        model = self._prepare(lux_state="30")
+        model.sensor_on()
+        assert model.state in ("active", "active_timer"), (
+            f"Expected activation at 30 lx < 100 lx, got {model.state}"
+        )
+
+    def test_activation_blocked_when_bright(self):
+        """At or above the threshold motion must not turn the lights on."""
+        model = self._prepare(lux_state="450")
+        model.sensor_on()
+        assert model.state == "idle", (
+            f"Expected idle at 450 lx >= 100 lx, got {model.state}"
+        )
+
+    def test_threshold_is_inclusive_upper_bound(self):
+        """Exactly at the threshold counts as bright (activation blocked)."""
+        model = self._prepare(lux_state="100")
+        model.sensor_on()
+        assert model.state == "idle"
+
+    def test_no_lux_config_allows_activation(self):
+        """Controllers without a lux constraint keep pre-lux behaviour."""
+        model = self._prepare()  # luxEntity/lux_threshold stay None
+        model.sensor_on()
+        assert model.state in ("active", "active_timer")
+
+    def test_unavailable_sensor_fails_open(self):
+        """A non-numeric state (unavailable/unknown) must not block lights."""
+        model = self._prepare(lux_state="unavailable")
+        model.sensor_on()
+        assert model.state in ("active", "active_timer"), (
+            f"Expected fail-open activation on unavailable sensor, got {model.state}"
+        )
+
+    def test_missing_entity_fails_open(self):
+        """A lux entity that does not exist in HA must not block lights."""
+        model = self._prepare(lux_state="whatever")
+        model.hass.states.get = MagicMock(return_value=None)
+        model.sensor_on()
+        assert model.state in ("active", "active_timer")
+
+    def test_bright_room_does_not_gate_timer_reset(self):
+        """Once active, sensor_on must keep resetting the timer even when the
+        (now lit) room reads above the threshold."""
+        model = self._prepare(lux_state="30")
+        model.sensor_on()
+        assert model.state == "active_timer"
+
+        # The controlled light pushed the reading past the threshold
+        state_obj = MagicMock()
+        state_obj.state = "800"
+        model.hass.states.get = MagicMock(return_value=state_obj)
+        model._reset_timer = MagicMock(return_value=True)
+
+        model.sensor_on()
+        assert model.state == "active_timer", (
+            f"Expected re-trigger to stay in active_timer, got {model.state}"
+        )
+        model._reset_timer.assert_called_once()
+
+    def test_bright_room_does_not_gate_blocked_path(self):
+        """idle → blocked (entities already on) must ignore the lux reading."""
+        model = self._prepare(lux_state="800")
+        model.is_state_entities_on = MagicMock(return_value=True)
+        model.is_state_entities_off = MagicMock(return_value=False)
+        model.is_block_enabled = MagicMock(return_value=True)
+        model.sensor_on()
+        assert model.state == "blocked"
+
+    def test_activate_service_bypasses_lux(self):
+        """The explicit activate service is a manual command — never gated."""
+        model = self._prepare(lux_state="800")
+        model.activate()
+        assert model.state in ("active", "active_timer")
+
+    def test_force_activate_bypasses_lux(self):
+        """Forced sensors bypass every constraint, lux included."""
+        model = self._prepare(lux_state="800")
+        model.force_activate()
+        assert model.state in ("active", "active_timer")
+
+    def test_blocked_activation_records_attributes(self):
+        """A lux-blocked activation must leave a diagnostic trail."""
+        model = self._prepare(lux_state="450")
+        model.update = MagicMock(wraps=model.update)
+        model.sensor_on()
+        keys = {}
+        for call in model.update.call_args_list:
+            keys.update(call.kwargs)
+        assert keys.get("lux_at_last_block") == 450.0
+        assert "lux_blocked_at" in keys
+
+    def test_config_lux_constraint_both_set(self):
+        model = _build_model()
+        model.config_lux_constraint(
+            {"lux_entity": "sensor.room_illuminance", "lux_threshold": 75}
+        )
+        assert model.luxEntity == "sensor.room_illuminance"
+        assert model.lux_threshold == 75.0
+
+    def test_config_lux_constraint_entity_without_threshold_disabled(self):
+        model = _build_model()
+        model.config_lux_constraint({"lux_entity": "sensor.room_illuminance"})
+        assert model.luxEntity is None
+        assert model.is_lux_constraint_satisfied() is True
+
+    def test_config_lux_constraint_threshold_without_entity_disabled(self):
+        model = _build_model()
+        model.config_lux_constraint({"lux_threshold": 75})
+        assert model.lux_threshold is None
+        assert model.is_lux_constraint_satisfied() is True
+
+    def test_lux_condition_present_in_machine(self):
+        """The idle → active sensor_on transition must carry the lux condition
+        alongside is_state_entities_off (and only that transition)."""
+        from transitions.extensions import HierarchicalMachine as Machine
+        from custom_components.entity_controller.const import STATES
+
+        machine = Machine(states=STATES, initial="pending", finalize_event="finalize")
+        _add_machine_transitions(machine)
+
+        def _condition_names(t):
+            names = []
+            for c in t.conditions:
+                f = c.func
+                names.append(f.__name__ if callable(f) else str(f))
+            return names
+
+        idle_active = [
+            t for t in machine.get_transitions("sensor_on")
+            if t.source == "idle" and t.dest == "active"
+        ]
+        gated = [
+            t for t in idle_active
+            if "is_lux_constraint_satisfied" in _condition_names(t)
+        ]
+        assert len(gated) == 1, (
+            "Expected exactly one lux-gated sensor_on idle → active transition"
+        )
+        assert "is_state_entities_off" in _condition_names(gated[0]), (
+            "The lux condition must gate the entities-off activation path"
+        )
