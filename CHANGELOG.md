@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+<a name="9.8.8"></a>
+## [9.8.8](https://github.com/pluskal/entity-controller/compare/v9.8.7...v9.8.8) (2026-08-15)
+
+
+### Features
+
+* **lux-constraint** – New `lux_bright_states` option extends the lux constraint to string-state light sensors (radar/mmWave presence sensors reporting `bright`/`dim`): activation from `idle` is blocked while the lux entity's state matches one of the listed strings, with the light-level calibration living in the sensor's own firmware. May be combined with `lux_threshold` on the same entity — numeric readings compare against the threshold, string states match the list. Numeric readings on a bright-states-only config fail open with a warning, as do `unavailable`/missing sensors. `lux_entity` now requires at least one of `lux_threshold`/`lux_bright_states` (config errors disable the constraint, as before).
+
+### Tests
+
+* Add `TestLuxBrightStates` (10 tests): bright blocks / dim allows / unavailable fails open, numeric-without-threshold fails open, combined-config numeric and string paths, diagnostic attributes, and config validation of all partial-config permutations.
+
 <a name="9.8.7"></a>
 ## [9.8.7](https://github.com/pluskal/entity-controller/compare/v9.8.6...v9.8.7) (2026-08-15)
 

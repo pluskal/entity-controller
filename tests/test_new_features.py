@@ -264,6 +264,7 @@ def _build_model(hass=None, entity=None, config=None):
         m._store = None
         m.luxEntity = None
         m.lux_threshold = None
+        m.lux_bright_states = []
         m.disable_block = False
         m.block_timeout = None
         m.grace_period = None
@@ -1326,3 +1327,86 @@ class TestLuxConstraint:
         assert "is_state_entities_off" in _condition_names(gated[0]), (
             "The lux condition must gate the entities-off activation path"
         )
+
+
+class TestLuxBrightStates:
+    """String-state (radar bright/dim) flavour of the lux constraint."""
+
+    def _prepare(self, lux_state, bright_states=("bright",), threshold=None):
+        model = _build_model()
+        model.is_state_entities_on = MagicMock(return_value=False)
+        model.is_state_entities_off = MagicMock(return_value=True)
+        model.luxEntity = "sensor.test_radar_illumination"
+        model.lux_bright_states = list(bright_states)
+        model.lux_threshold = threshold
+        state_obj = MagicMock()
+        state_obj.state = lux_state
+        model.hass.states.get = MagicMock(return_value=state_obj)
+        return model
+
+    def test_bright_state_blocks_activation(self):
+        model = self._prepare("bright")
+        model.sensor_on()
+        assert model.state == "idle", (
+            f"Expected idle on 'bright' radar state, got {model.state}"
+        )
+
+    def test_dim_state_allows_activation(self):
+        model = self._prepare("dim")
+        model.sensor_on()
+        assert model.state in ("active", "active_timer")
+
+    def test_unavailable_fails_open(self):
+        model = self._prepare("unavailable")
+        model.sensor_on()
+        assert model.state in ("active", "active_timer")
+
+    def test_numeric_state_without_threshold_fails_open(self):
+        """A numeric reading on a bright-states-only sensor must not block."""
+        model = self._prepare("450")
+        model.sensor_on()
+        assert model.state in ("active", "active_timer")
+
+    def test_combined_numeric_uses_threshold(self):
+        """With both configured, numeric readings compare to the threshold."""
+        model = self._prepare("450", threshold=100.0)
+        model.sensor_on()
+        assert model.state == "idle"
+
+    def test_combined_string_uses_bright_states(self):
+        """With both configured, string readings match lux_bright_states."""
+        model = self._prepare("bright", threshold=100.0)
+        model.sensor_on()
+        assert model.state == "idle"
+
+    def test_blocked_records_string_state(self):
+        model = self._prepare("bright")
+        model.update = MagicMock(wraps=model.update)
+        model.sensor_on()
+        keys = {}
+        for call in model.update.call_args_list:
+            keys.update(call.kwargs)
+        assert keys.get("lux_at_last_block") == "bright"
+        assert "lux_blocked_at" in keys
+
+    def test_config_bright_states_without_threshold_is_valid(self):
+        model = _build_model()
+        model.config_lux_constraint(
+            {"lux_entity": "sensor.radar_illumination",
+             "lux_bright_states": ["bright"]}
+        )
+        assert model.luxEntity == "sensor.radar_illumination"
+        assert model.lux_bright_states == ["bright"]
+        assert model.lux_threshold is None
+
+    def test_config_entity_without_any_criterion_disabled(self):
+        model = _build_model()
+        model.config_lux_constraint({"lux_entity": "sensor.radar_illumination"})
+        assert model.luxEntity is None
+        assert model.is_lux_constraint_satisfied() is True
+
+    def test_config_bright_states_without_entity_disabled(self):
+        model = _build_model()
+        model.config_lux_constraint({"lux_bright_states": ["bright"]})
+        assert model.lux_bright_states == []
+        assert model.is_lux_constraint_satisfied() is True

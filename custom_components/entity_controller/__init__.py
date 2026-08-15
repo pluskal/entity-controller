@@ -114,6 +114,7 @@ from .const import (
     CONF_EVENT_SENSOR_TYPE,
     CONF_LUX_ENTITY,
     CONF_LUX_THRESHOLD,
+    CONF_LUX_BRIGHT_STATES,
     STORAGE_VERSION,
     STORAGE_KEY_PREFIX,
 )
@@ -176,6 +177,7 @@ ENTITY_SCHEMA = vol.Schema(
         vol.Optional(CONF_EVENT_SENSORS, default=[]): vol.All(cv.ensure_list, [cv.string]),
         vol.Optional(CONF_LUX_ENTITY, default=None): vol.Any(None, cv.entity_id),
         vol.Optional(CONF_LUX_THRESHOLD, default=None): vol.Any(None, vol.Coerce(float)),
+        vol.Optional(CONF_LUX_BRIGHT_STATES, default=[]): vol.All(cv.ensure_list, [cv.string]),
         vol.Optional(CONF_SERVICE_DATA, default=None): vol.Coerce(
             dict
         ),
@@ -534,6 +536,7 @@ class EntityController(entity.Entity):
             "end_time",
             "lux_entity",
             "lux_threshold",
+            "lux_bright_states",
         ]
         for k, v in self.attributes.items():
             if k in PERSISTED_STATE_ATTRIBUTES:
@@ -609,6 +612,7 @@ class Model:
         self._store = None  # HA storage for state persistence
         self.luxEntity = None
         self.lux_threshold = None
+        self.lux_bright_states = []
 
         self.log.debug(
             "Initialising EntityController entity with this configuration: "
@@ -1005,47 +1009,78 @@ class Model:
     def is_block_enabled(self):
         return self.disable_block is False
 
-    def _lux_state(self):
-        """Return the current illuminance reading as a float, or None when the
-        lux entity is missing, unavailable, or has a non-numeric state."""
-        s = self.hass.states.get(self.luxEntity)
-        try:
-            return float(s.state)
-        except (AttributeError, TypeError, ValueError):
-            return None
-
     def is_lux_constraint_satisfied(self):
         """Whether the illuminance constraint allows turning the lights on.
 
-        True when no lux constraint is configured, when the measured
-        illuminance is below ``lux_threshold``, or when the lux entity has no
-        numeric state. Failing open on a broken sensor is deliberate: a dead
-        battery must degrade to pre-lux behaviour (lights turn on), never to
-        a permanently dark room.
+        Two sensor flavours are supported on the same ``lux_entity``:
+
+        - numeric readings (PIR-style lux sensors) are compared against
+          ``lux_threshold``: activation requires reading < threshold;
+        - string states (radar-style two-level sensors reporting e.g.
+          ``bright``/``dim``) block activation when the state matches one of
+          ``lux_bright_states`` — the calibration lives in the sensor's own
+          firmware.
+
+        Anything else — no constraint configured, unavailable/unknown state,
+        a numeric reading without a configured threshold, or a string not in
+        ``lux_bright_states`` — allows activation. Failing open on a broken
+        sensor is deliberate: a dead battery must degrade to pre-lux
+        behaviour (lights turn on), never to a permanently dark room.
         """
-        if self.luxEntity is None or self.lux_threshold is None:
+        if self.luxEntity is None:
             return True
-        value = self._lux_state()
-        if value is None:
+        s = self.hass.states.get(self.luxEntity)
+        try:
+            state = s.state
+        except AttributeError:
             self.log.warning(
-                "is_lux_constraint_satisfied :: Lux entity %s has no numeric state; failing open (activation allowed).",
+                "is_lux_constraint_satisfied :: Lux entity %s does not exist; failing open (activation allowed).",
                 self.luxEntity,
             )
             return True
-        if value >= self.lux_threshold:
+
+        try:
+            value = float(state)
+        except (TypeError, ValueError):
+            value = None
+
+        if value is not None:
+            if self.lux_threshold is None:
+                self.log.warning(
+                    "is_lux_constraint_satisfied :: %s reports numeric %s but no lux_threshold is configured; failing open.",
+                    self.luxEntity,
+                    value,
+                )
+                return True
+            if value >= self.lux_threshold:
+                self.log.debug(
+                    "is_lux_constraint_satisfied :: Activation blocked: %s reports %s lx >= threshold %s lx.",
+                    self.luxEntity,
+                    value,
+                    self.lux_threshold,
+                )
+                self.update(lux_blocked_at=str(datetime.now()), lux_at_last_block=value)
+                return False
             self.log.debug(
-                "is_lux_constraint_satisfied :: Activation blocked: %s reports %s lx >= threshold %s lx.",
+                "is_lux_constraint_satisfied :: %s reports %s lx < threshold %s lx; activation allowed.",
                 self.luxEntity,
                 value,
                 self.lux_threshold,
             )
-            self.update(lux_blocked_at=str(datetime.now()), lux_at_last_block=value)
+            return True
+
+        if state in self.lux_bright_states:
+            self.log.debug(
+                "is_lux_constraint_satisfied :: Activation blocked: %s reports '%s' (in lux_bright_states).",
+                self.luxEntity,
+                state,
+            )
+            self.update(lux_blocked_at=str(datetime.now()), lux_at_last_block=state)
             return False
         self.log.debug(
-            "is_lux_constraint_satisfied :: %s reports %s lx < threshold %s lx; activation allowed.",
+            "is_lux_constraint_satisfied :: %s reports non-bright state '%s'; activation allowed.",
             self.luxEntity,
-            value,
-            self.lux_threshold,
+            state,
         )
         return True
 
@@ -1416,36 +1451,50 @@ class Model:
     def config_lux_constraint(self, config):
         """Configure the optional illuminance (lux) activation constraint.
 
-        When both ``lux_entity`` and ``lux_threshold`` are set, sensor_on
-        activation from ``idle`` (with the state entities off) requires the
-        measured illuminance to be below the threshold. Everything else —
-        timer resets, blocked handling, overrides, forced sensors, and the
-        ``activate`` service — is unaffected, so a running controller keeps
-        managing lights whose own output pushes the reading past the
-        threshold, and a manual activation always works.
+        When ``lux_entity`` is set together with ``lux_threshold`` (numeric
+        sensors) and/or ``lux_bright_states`` (string bright/dim sensors),
+        sensor_on activation from ``idle`` (with the state entities off)
+        requires the room to be dark enough. Everything else — timer resets,
+        blocked handling, overrides, forced sensors, and the ``activate``
+        service — is unaffected, so a running controller keeps managing
+        lights whose own output pushes the reading past the threshold, and a
+        manual activation always works.
         """
         self.luxEntity = config.get(CONF_LUX_ENTITY, None)
         self.lux_threshold = config.get(CONF_LUX_THRESHOLD, None)
+        self.lux_bright_states = config.get(CONF_LUX_BRIGHT_STATES, []) or []
 
-        if self.luxEntity is not None and self.lux_threshold is None:
+        if self.luxEntity is not None and self.lux_threshold is None \
+                and not self.lux_bright_states:
             self.log.error(
-                "lux_entity is set but lux_threshold is not. The lux constraint is disabled."
+                "lux_entity is set but neither lux_threshold nor lux_bright_states is. "
+                "The lux constraint is disabled."
             )
             self.luxEntity = None
-        if self.lux_threshold is not None and self.luxEntity is None:
+        if self.luxEntity is None and (
+            self.lux_threshold is not None or self.lux_bright_states
+        ):
             self.log.error(
-                "lux_threshold is set but lux_entity is not. The lux constraint is disabled."
+                "lux_threshold/lux_bright_states are set but lux_entity is not. "
+                "The lux constraint is disabled."
             )
             self.lux_threshold = None
+            self.lux_bright_states = []
 
         if self.luxEntity is not None:
-            self.lux_threshold = float(self.lux_threshold)
+            if self.lux_threshold is not None:
+                self.lux_threshold = float(self.lux_threshold)
             self.log.debug(
-                "Lux constraint: activation requires %s < %s lx",
+                "Lux constraint: %s, threshold %s, bright states %s",
                 self.luxEntity,
                 self.lux_threshold,
+                self.lux_bright_states,
             )
-            self.update(lux_entity=self.luxEntity, lux_threshold=self.lux_threshold)
+            self.update(
+                lux_entity=self.luxEntity,
+                lux_threshold=self.lux_threshold,
+                lux_bright_states=self.lux_bright_states or None,
+            )
 
     def config_other(self, config):
         self.do_draw = config.get("draw", False)
@@ -2173,6 +2222,7 @@ class Model:
         self.log.debug("Ignored state attrs:    %s", str(self.state_attributes_ignore))
         self.log.debug("Lux Entity:             %s", str(self.luxEntity))
         self.log.debug("Lux Threshold:          %s", str(self.lux_threshold))
+        self.log.debug("Lux Bright States:      %s", str(self.lux_bright_states))
         self.log.debug("Light params:           %s", str(self.lightParams))
         self.log.debug("        -------        Time        -------        ")
         self.log.debug("Start time:             %s", self._start_time_private)
