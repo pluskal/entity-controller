@@ -714,6 +714,15 @@ class Model:
         entity = event.data["entity_id"]
         old = event.data["old_state"]
         new = event.data["new_state"]
+        if new is None:
+            # Entita zmizela (reload platformy / odebrani ze systemu) — neni
+            # co vyhodnocovat. Bez teto pojistky spadne uz log nize na
+            # 'NoneType' object has no attribute ...' (HA 2026.7 posila
+            # state_changed s new_state=None pri odstraneni entity).
+            self.log.debug(
+                "%s :: new_state is None (entity %s removed) — ignoruji",
+                "sensor_state_change", str(entity))
+            return
         self.log.debug("sensor_state_change :: %10s Sensor state change to: %s" % ( pprint.pformat(entity), new.state))
         self.log.debug("sensor_state_change :: state: " +  pprint.pformat(self.state))
 
@@ -758,6 +767,15 @@ class Model:
         entity = event.data["entity_id"]
         old = event.data["old_state"]
         new = event.data["new_state"]
+        if new is None:
+            # Entita zmizela (reload platformy / odebrani ze systemu) — neni
+            # co vyhodnocovat. Bez teto pojistky spadne uz log nize na
+            # 'NoneType' object has no attribute ...' (HA 2026.7 posila
+            # state_changed s new_state=None pri odstraneni entity).
+            self.log.debug(
+                "%s :: new_state is None (entity %s removed) — ignoruji",
+                "override_state_change", str(entity))
+            return
         self.log.debug("override_state_change :: Override state change entity=%s, old=%s, new=%s" % ( entity, old, new))
         if self.matches(new.state, self.OVERRIDE_ON_STATE) and (
             self.is_active()
@@ -782,6 +800,15 @@ class Model:
         entity = event.data["entity_id"]
         old = event.data["old_state"]
         new = event.data["new_state"]
+        if new is None:
+            # Entita zmizela (reload platformy / odebrani ze systemu) — neni
+            # co vyhodnocovat. Bez teto pojistky spadne uz log nize na
+            # 'NoneType' object has no attribute ...' (HA 2026.7 posila
+            # state_changed s new_state=None pri odstraneni entity).
+            self.log.debug(
+                "%s :: new_state is None (entity %s removed) — ignoruji",
+                "state_entity_state_change", str(entity))
+            return
         """ State change callback for state entities. This can be called with either a state change or an attribute change. """
         self.log.debug(
             "state_entity_state_change :: [ Entity: %s, Context: %s ]\n\tOld state: %s\n\tNew State: %s",
