@@ -113,6 +113,7 @@ from .const import (
 
     # New features
     CONF_FORCED_SENSORS,
+    CONF_HOLD_SENSORS,
     CONF_EVENT_SENSORS,
     CONF_EVENT_SENSOR_TYPE,
     CONF_LUX_ENTITY,
@@ -191,6 +192,7 @@ ENTITY_SCHEMA = vol.Schema(
         vol.Optional(CONF_STATE_ATTRIBUTES_IGNORE, default=[]): cv.ensure_list,
         vol.Optional(CONF_IGNORED_EVENT_SOURCES, default=[]): cv.ensure_list,
         vol.Optional(CONF_FORCED_SENSORS, default=[]): cv.entity_ids,
+        vol.Optional(CONF_HOLD_SENSORS, default=[]): cv.entity_ids,
         vol.Optional(CONF_EVENT_SENSORS, default=[]): vol.All(cv.ensure_list, [cv.string]),
         vol.Optional(CONF_LUX_ENTITY, default=None): vol.Any(None, cv.entity_id),
         vol.Optional(CONF_LUX_THRESHOLD, default=None): vol.Any(None, vol.Coerce(float)),
@@ -664,6 +666,7 @@ class Model:
             config
         )  # must come after config_control_entities (uses control entities if not set)
         self.config_sensor_entities(config)
+        self.config_hold_sensor_entities(config)
         self.config_forced_sensor_entities(config)
         self.config_event_sensors(config)
         self.config_override_entities(config)
@@ -763,6 +766,50 @@ class Model:
                 # We only care about sensor off state changes when the sensor is a duration sensor and we are in active_timer state.
                 self.sensor_off_duration()
                 self.log.debug("sensor_state_change :: CONF_SENSOR_RESETS_TIMER - normal")
+
+    @callback
+    def hold_sensor_state_change(self, event):
+        """Hold senzor: drzi svetlo rozsvicene, ale nikdy ho nezapina."""
+        entity = event.data["entity_id"]
+        old = event.data["old_state"]
+        new = event.data["new_state"]
+        if new is None:
+            return
+        try:
+            if old is not None and new.state == old.state:
+                return  # jen zmena atributu
+        except AttributeError:
+            pass
+
+        if self.matches(new.state, self.SENSOR_ON_STATE):
+            # ZAMERNE nevolame sensor_on() — hold senzor nesmi rozsvecet.
+            # Kdyz uz bezi timer, chovame se jako keep-alive.
+            if self.is_active_timer():
+                self.set_context(new.context)
+                self.update(last_triggered_by=f"hold:{entity}",
+                            notes="Hold sensor is on, keeping the light on")
+                self._cancel_timer()
+                self.update(expires_at="pending sensor")
+            else:
+                self.log.debug(
+                    "hold_sensor_state_change :: %s je ON, ale nezapinam (stav %s)",
+                    entity, self.state)
+            return
+
+        if (
+            self.matches(new.state, self.SENSOR_OFF_STATE)
+            and self.is_duration_sensor()
+            and self.is_active_timer()
+        ):
+            # Hold senzor zhasl — timer se rozjede az kdyz uz nic nedrzi.
+            if self.is_sensor_on():
+                self.log.debug(
+                    "hold_sensor_state_change :: %s je OFF, ale jiny senzor jeste drzi", entity)
+                return
+            self.set_context(new.context)
+            self.update(last_triggered_by=f"hold:{entity}", sensor_turned_off_at=datetime.now(),
+                        notes="Hold sensor turned off, timer started")
+            self._reset_timer()
 
     @callback
     def override_state_change(self, event):
@@ -1009,7 +1056,8 @@ class Model:
         return self._override_entity_state() is not None
 
     def _sensor_entity_state(self):
-        for e in self.sensorEntities:
+        # hold senzory se pocitaji stejne jako bezne — drzi timer (is_sensor_on)
+        for e in list(self.sensorEntities) + list(getattr(self, "holdSensorEntities", [])):
             s = self.hass.states.get(e)
             try:
                 state = s.state
@@ -1345,6 +1393,22 @@ class Model:
         if self.sensorEntities:
             event.async_track_state_change_event(
                 self.hass, self.sensorEntities, self.sensor_state_change
+            )
+
+    def config_hold_sensor_entities(self, config):
+        """Senzory, ktere svetlo nezapinaji, ale drzi ho rozsvicene.
+
+        Motivace: 'zapni z PIR, drz z PIR + radaru'. Radar v `sensors:` by
+        svetlo rozsvecel i sam (a pri flapovani zbytecne blikal), proto ma
+        vlastni kategorii: do `_sensor_entity_state()` se pocita (takze drzi
+        timer pres is_sensor_on()), ale jeho zapnuti nikdy nevyvola aktivaci.
+        """
+        self.holdSensorEntities = []
+        self.add(self.holdSensorEntities, config, CONF_HOLD_SENSORS)
+        if self.holdSensorEntities:
+            self.log.debug("Hold Sensor Entities: %s", pprint.pformat(self.holdSensorEntities))
+            event.async_track_state_change_event(
+                self.hass, self.holdSensorEntities, self.hold_sensor_state_change
             )
 
     def config_forced_sensor_entities(self, config):

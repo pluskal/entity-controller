@@ -30,6 +30,11 @@ SERVICE_SET_NIGHT_MODE = "set_night_mode"
 
 # Forced sensors (bypass blocked/constrained/overridden states)
 CONF_FORCED_SENSORS = "forced_sensors"
+# Senzory, ktere svetlo NEZAPINAJI, ale drzi ho rozsvicene (keep-alive).
+# Pouziti: zapnout z PIR (rychla, spolehliva hrana), drzet z PIR + radaru
+# (radar vidi i nehybneho cloveka). Radar v sensors: by svetlo rozsvecel
+# i pri svem flapovani — 103 radar prepina 54x/den, 16 % mezer <=60 s.
+CONF_HOLD_SENSORS = "hold_sensors"
 
 # Event bus sensor support
 CONF_EVENT_SENSORS = "event_sensors"
