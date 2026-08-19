@@ -607,6 +607,9 @@ class Model:
         self.triggerOnDeactivate = []
         self.triggerOnActivate = []
         self.timer_handle = None
+        self._expiry_time = None   # kdy ma dobehnout timer (pro obnovu po restartu)
+        self._pending_restore_expiry = None  # dojezd timeru pres restart
+        self._restore_retries = 0            # kolikrat jsme cekali na nedostupnou entitu
         self.block_timer_handle = None
         self.sensor_type = None
         self.night_mode = None
@@ -932,6 +935,7 @@ class Model:
         # self.timer_handle = event.async_call_later(self.hass, self.previous_delay, self.timer_expire)
         self.timer_handle = Timer(self.previous_delay, self.timer_expire)
         self.timer_handle.start()
+        self._expiry_time = expiry_time
         self.update(expires_at=expiry_time)
 
     def _cancel_timer(self):
@@ -1674,6 +1678,11 @@ class Model:
         data = {
             "state": self.state,
             "saved_at": str(datetime.now()),
+            # Cas dobehnuti timeru je potreba, aby se po restartu dalo
+            # dojezd dokoncit — jinak EC skonci v 'idle' a rizene svetlo
+            # uz nikdo nezhasne (mereno 2026-08-19: z 24 restartu zustalo
+            # 21x svetlo svitit, chvost po poslednim pohybu 20-40 min).
+            "expires_at": str(self._expiry_time) if self._expiry_time else None,
         }
         self.log.debug("_async_save_state :: Saving state: %s", data)
         await self._store.async_save(data)
@@ -1720,9 +1729,108 @@ class Model:
                 return True
             return False
 
-        # For all other states (idle, constrained, active_timer, etc.) let the
-        # normal startup evaluation run.
+        if saved_state == "active_timer":
+            # Timer bezel, kdyz se HA vypinalo. Bez obnovy skonci EC v 'idle'
+            # a rizene svetlo uz nikdo nezhasne — jen novy pohyb cyklus
+            # dokonci. Mereno 2026-08-19 na produkci: z 24 restartu zustalo
+            # 21x svetlo svitit, chvost po poslednim pohybu 20-40 min misto
+            # ocekavanych ~5,5 min (hold 90 s + delay 240 s).
+            if not self.is_state_entities_on():
+                # Svetlo se mezitim zhaslo (rucne nebo jinou automatizaci) —
+                # neni co dokoncovat.
+                return False
+            expiry = self._parse_saved_expiry(data.get("expires_at"))
+            if expiry is None:
+                return False
+            zbyva = (expiry - datetime.now()).total_seconds()
+            if zbyva <= 1:
+                # POZOR: start_monitoring() smi byt jen tady, kde vracime True.
+                # Ve druhe vetvi vracime False a caller ho zavola sam — jinak
+                # by se zaregistroval dvakrat.
+                self.start_monitoring()
+                # Timer by vyprsel, zatimco HA nebezelo -> dokoncit zhasnuti.
+                self.log.info(
+                    "_async_restore_state :: Timer expired while HA was down (%s), turning control entities off",
+                    expiry)
+                self.turn_off_control_entities()
+                self.update(notes="Timer expired while HA was down — entities turned off")
+                return True
+            # Timer jeste nedobehl. Nesnazime se ho nasadit pres sensor_on() —
+            # ten pri uz svitici entite vede zamerne do 'blocked' (stejnou
+            # cestu pouziva i obnova blokace vyse). Misto toho necha EC bezet
+            # normalne a jen dokoncime to, co timer nedokoncil: po zbyvajicim
+            # case zhasnout, pokud EC mezitim nevzal rizeni na sebe.
+            self._pending_restore_expiry = expiry
+            self.log.info(
+                "_async_restore_state :: Timer from before restart has %.0f s left, scheduling turn-off",
+                zbyva)
+            self.update(notes="Timer from before restart: %.0f s left" % zbyva)
+            event.async_call_later(self.hass, zbyva, self._restore_timer_finish)
+            return False
+
+        # For all other states (idle, constrained, etc.) let the normal startup
+        # evaluation run.
         return False
+
+    @callback
+    def _restore_timer_finish(self, _now=None):
+        """Dokonci zhasnuti, ktere melo provest timer bezici pred restartem.
+
+        Stoji mimo stavovy automat zamerne: kdyz je rizene svetlo pri startu
+        rozsvicene, EC skonci v 'blocked' (cizi ovladani) nebo 'idle' a samo
+        uz nezhasne. Pokud ale mezitim prisel pohyb a EC rizeni prevzal
+        (active_timer / overridden), nezasahujeme.
+        """
+        expiry = self._pending_restore_expiry
+        if expiry is None:
+            return
+        if self.is_active_timer() or self.is_overridden():
+            self._pending_restore_expiry = None
+            self.log.debug("_restore_timer_finish :: EC uz rizeni prevzal, nezasahuji")
+            return
+        # Klicovy pripad: pri inicializaci EC (STARTUP_DELAY) jsou zarovky za
+        # rele casto jeste 'unavailable', protoze localtuya/Tasmota nabiha
+        # pozdeji. EC v te chvili sice vstoupi do idle a posle turn_off, ale
+        # ten padne do prazdna; kdyz se svetlo pak objevi rozsvicene, EC to
+        # bere jako cizi ovladani a skonci v 'blocked' -> uz nikdy nezhasne.
+        # Proto tady na nedostupnou entitu cekame, misto abychom to vzdali.
+        if self._state_entities_unavailable():
+            if self._restore_retries < 10:
+                self._restore_retries += 1
+                self.log.debug(
+                    "_restore_timer_finish :: Rizena entita je nedostupna, zkusim znovu za 30 s (%d/10)",
+                    self._restore_retries)
+                event.async_call_later(self.hass, 30, self._restore_timer_finish)
+            else:
+                self._pending_restore_expiry = None
+                self.log.warning(
+                    "_restore_timer_finish :: Rizena entita zustala nedostupna, vzdavam dojezd")
+            return
+        self._pending_restore_expiry = None
+        if not self.is_state_entities_on():
+            self.log.debug("_restore_timer_finish :: Svetlo uz nesviti, nic nedelam")
+            return
+        self.log.info("_restore_timer_finish :: Turning control entities off (timer from before restart)")
+        self.turn_off_control_entities()
+        self.update(notes="Turned off by timer carried over the restart")
+
+    def _state_entities_unavailable(self):
+        """True, kdyz aspon jedna rizena/stavova entita jeste neni k dispozici."""
+        for e in self.stateEntities:
+            st = self.hass.states.get(e)
+            if st is None or st.state in ("unavailable", "unknown"):
+                return True
+        return False
+
+    def _parse_saved_expiry(self, raw):
+        """Prevede ulozeny cas vyprseni na datetime (naivni lokalni cas)."""
+        if not raw or raw == "None":
+            return None
+        try:
+            return datetime.fromisoformat(str(raw))
+        except ValueError:
+            self.log.warning("_parse_saved_expiry :: Nelze precist ulozeny expires_at: %s", raw)
+            return None
 
     @callback
     def constrain_entity(self, evt):
