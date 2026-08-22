@@ -1799,12 +1799,24 @@ class Model:
             # dokonci. Mereno 2026-08-19 na produkci: z 24 restartu zustalo
             # 21x svetlo svitit, chvost po poslednim pohybu 20-40 min misto
             # ocekavanych ~5,5 min (hold 90 s + delay 240 s).
+            expiry = self._parse_saved_expiry(data.get("expires_at"))
+            if expiry is None:
+                return False
+            if self._state_entities_unavailable():
+                # Rizena entita jeste nenabehla — zarovky za rele se hlasi
+                # pozdeji, nez EC startuje (STARTUP_DELAY = 70 s). PRAVE tohle
+                # je ten pripad, kdy se i povel z on_enter_idle ztrati a svetlo
+                # pak visi, takze to nesmime vzdat: rozhodnuti odlozime na
+                # _restore_timer_finish, ktery na entitu pocka.
+                self._pending_restore_expiry = expiry
+                self.log.info(
+                    "_async_restore_state :: Rizena entita jeste neni dostupna, "
+                    "odkladam rozhodnuti o dojezdu (expiry %s)", expiry)
+                event.async_call_later(self.hass, 30, self._restore_timer_finish)
+                return False
             if not self.is_state_entities_on():
                 # Svetlo se mezitim zhaslo (rucne nebo jinou automatizaci) —
                 # neni co dokoncovat.
-                return False
-            expiry = self._parse_saved_expiry(data.get("expires_at"))
-            if expiry is None:
                 return False
             zbyva = (expiry - datetime.now()).total_seconds()
             if zbyva <= 1:
@@ -1870,10 +1882,20 @@ class Model:
                 self.log.warning(
                     "_restore_timer_finish :: Rizena entita zustala nedostupna, vzdavam dojezd")
             return
-        self._pending_restore_expiry = None
         if not self.is_state_entities_on():
+            self._pending_restore_expiry = None
             self.log.debug("_restore_timer_finish :: Svetlo uz nesviti, nic nedelam")
             return
+        # Entita je dostupna a sviti. Kdyz timer jeste nedobehl (typicky kdyz
+        # jsme sem prisli z odlozeneho rozhodnuti po 30 s), pockame presne
+        # zbyvajici cas — jinak bychom zhasli driv, nez mel timer vyprset.
+        zbyva = (expiry - datetime.now()).total_seconds()
+        if zbyva > 1:
+            self.log.debug(
+                "_restore_timer_finish :: Entita je zpet, timeru zbyva %.0f s", zbyva)
+            event.async_call_later(self.hass, zbyva, self._restore_timer_finish)
+            return
+        self._pending_restore_expiry = None
         self.log.info("_restore_timer_finish :: Turning control entities off (timer from before restart)")
         self.turn_off_control_entities()
         self.update(notes="Turned off by timer carried over the restart")
