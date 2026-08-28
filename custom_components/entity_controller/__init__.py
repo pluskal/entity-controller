@@ -26,6 +26,8 @@ import asyncio
 import functools
 import hashlib
 import logging
+from homeassistant.const import STATE_UNAVAILABLE
+from homeassistant.util import dt as dt_util
 import re
 from datetime import date, datetime, time, timedelta
 from threading import Timer
@@ -114,6 +116,7 @@ from .const import (
     # New features
     CONF_FORCED_SENSORS,
     CONF_HOLD_SENSORS,
+    CONF_HOLD_MAX_SECONDS,
     CONF_EVENT_SENSORS,
     CONF_EVENT_SENSOR_TYPE,
     CONF_LUX_ENTITY,
@@ -193,6 +196,9 @@ ENTITY_SCHEMA = vol.Schema(
         vol.Optional(CONF_IGNORED_EVENT_SOURCES, default=[]): cv.ensure_list,
         vol.Optional(CONF_FORCED_SENSORS, default=[]): cv.entity_ids,
         vol.Optional(CONF_HOLD_SENSORS, default=[]): cv.entity_ids,
+        vol.Optional(CONF_HOLD_MAX_SECONDS, default=7200): vol.Any(
+            cv.positive_int, None
+        ),
         vol.Optional(CONF_EVENT_SENSORS, default=[]): vol.All(cv.ensure_list, [cv.string]),
         vol.Optional(CONF_LUX_ENTITY, default=None): vol.Any(None, cv.entity_id),
         vol.Optional(CONF_LUX_THRESHOLD, default=None): vol.Any(None, vol.Coerce(float)),
@@ -610,7 +616,7 @@ class Model:
         self.triggerOnActivate = []
         self.timer_handle = None
         self._expiry_time = None   # kdy ma dobehnout timer (pro obnovu po restartu)
-        self._pending_restore_expiry = None  # dojezd timeru pres restart
+        self._pending_restore_expiry = None  # timer run-out carried over a restart
         self._restore_retries = 0            # kolikrat jsme cekali na nedostupnou entitu
         self.block_timer_handle = None
         self.sensor_type = None
@@ -721,12 +727,12 @@ class Model:
         old = event.data["old_state"]
         new = event.data["new_state"]
         if new is None:
-            # Entita zmizela (reload platformy / odebrani ze systemu) — neni
-            # co vyhodnocovat. Bez teto pojistky spadne uz log nize na
-            # 'NoneType' object has no attribute ...' (HA 2026.7 posila
-            # state_changed s new_state=None pri odstraneni entity).
+            # The entity is gone (platform reload / removed from the system),
+            # so there is nothing to evaluate. Without this guard the log call
+            # below already raises "'NoneType' object has no attribute ..."
+            # (HA 2026.7 sends state_changed with new_state=None on removal).
             self.log.debug(
-                "%s :: new_state is None (entity %s removed) — ignoruji",
+                "%s :: new_state is None (entity %s removed) — ignoring",
                 "sensor_state_change", str(entity))
             return
         self.log.debug("sensor_state_change :: %10s Sensor state change to: %s" % ( pprint.pformat(entity), new.state))
@@ -769,7 +775,7 @@ class Model:
 
     @callback
     def hold_sensor_state_change(self, event):
-        """Hold senzor: drzi svetlo rozsvicene, ale nikdy ho nezapina."""
+        """Hold sensor: keeps the light on, but never switches it on."""
         entity = event.data["entity_id"]
         old = event.data["old_state"]
         new = event.data["new_state"]
@@ -782,7 +788,8 @@ class Model:
             pass
 
         if self.matches(new.state, self.SENSOR_ON_STATE):
-            # ZAMERNE nevolame sensor_on() — hold senzor nesmi rozsvecet.
+            # DELIBERATELY not calling sensor_on() — a hold sensor must never
+            # switch the light on.
             # Kdyz uz bezi timer, chovame se jako keep-alive.
             if self.is_active_timer():
                 self.set_context(new.context)
@@ -801,10 +808,11 @@ class Model:
             and self.is_duration_sensor()
             and self.is_active_timer()
         ):
-            # Hold senzor zhasl — timer se rozjede az kdyz uz nic nedrzi.
+            # Hold sensor went off — the timer only starts once nothing holds
+            # it any more.
             if self.is_sensor_on():
                 self.log.debug(
-                    "hold_sensor_state_change :: %s je OFF, ale jiny senzor jeste drzi", entity)
+                    "hold_sensor_state_change :: %s is OFF, but another sensor still holds", entity)
                 return
             self.set_context(new.context)
             self.update(last_triggered_by=f"hold:{entity}", sensor_turned_off_at=datetime.now(),
@@ -818,12 +826,12 @@ class Model:
         old = event.data["old_state"]
         new = event.data["new_state"]
         if new is None:
-            # Entita zmizela (reload platformy / odebrani ze systemu) — neni
-            # co vyhodnocovat. Bez teto pojistky spadne uz log nize na
-            # 'NoneType' object has no attribute ...' (HA 2026.7 posila
-            # state_changed s new_state=None pri odstraneni entity).
+            # The entity is gone (platform reload / removed from the system),
+            # so there is nothing to evaluate. Without this guard the log call
+            # below already raises "'NoneType' object has no attribute ..."
+            # (HA 2026.7 sends state_changed with new_state=None on removal).
             self.log.debug(
-                "%s :: new_state is None (entity %s removed) — ignoruji",
+                "%s :: new_state is None (entity %s removed) — ignoring",
                 "override_state_change", str(entity))
             return
         self.log.debug("override_state_change :: Override state change entity=%s, old=%s, new=%s" % ( entity, old, new))
@@ -851,12 +859,12 @@ class Model:
         old = event.data["old_state"]
         new = event.data["new_state"]
         if new is None:
-            # Entita zmizela (reload platformy / odebrani ze systemu) — neni
-            # co vyhodnocovat. Bez teto pojistky spadne uz log nize na
-            # 'NoneType' object has no attribute ...' (HA 2026.7 posila
-            # state_changed s new_state=None pri odstraneni entity).
+            # The entity is gone (platform reload / removed from the system),
+            # so there is nothing to evaluate. Without this guard the log call
+            # below already raises "'NoneType' object has no attribute ..."
+            # (HA 2026.7 sends state_changed with new_state=None on removal).
             self.log.debug(
-                "%s :: new_state is None (entity %s removed) — ignoruji",
+                "%s :: new_state is None (entity %s removed) — ignoring",
                 "state_entity_state_change", str(entity))
             return
         """ State change callback for state entities. This can be called with either a state change or an attribute change. """
@@ -873,6 +881,62 @@ class Model:
         if self.is_within_grace_period():
             self.log.debug("state_entity_state_change :: Ignoring this state change because we are within the grace period (until %s)", self.ignore_state_changes_until)
             return
+
+        # --- Resync after unavailability (2026-08-23) ---------------------
+        # A controlled entity (relay/light) dropped off WiFi and came back.
+        # That is NOT manual control, so it must not be evaluated as external
+        # control (it used to push EC into 'blocked', after which the timer
+        # never completed again).
+        # It is also the only moment when the state can be genuinely stuck:
+        # if EC wanted to turn the light off during the outage, that command
+        # was dropped.
+        #
+        # Replaces the naive Turnoff_light_from_unavailable automation, which
+        # turned lights off UNCONDITIONALLY. Measured over 7 days: 11 firings,
+        # 10 of them wrong (91 %) — in 9 cases a sensor in the room was active,
+        # and once EC turned the light back on after just 2 s (visible flash).
+        # Hence: only turn off when EC is 'idle' AND no sensor reports motion.
+        try:
+            came_back = (
+                old is not None
+                and getattr(old, "state", None) == STATE_UNAVAILABLE
+                and getattr(new, "state", None) != STATE_UNAVAILABLE
+            )
+        except AttributeError:
+            came_back = False
+        if came_back:
+            is_on = self.matches(new.state, self.CONTROL_ON_STATE)
+            self.log.info(
+                "state_entity_state_change :: %s came back from unavailable as '%s' (EC state: %s) — resync",
+                str(entity), str(new.state), self.state,
+            )
+            if self.is_active_timer() or self.is_active_stay_on():
+                # EC wants the light on: if it came back off, turn it on.
+                if not is_on:
+                    self.log.info("resync :: timer is running but entity came back off — turning on")
+                    self.turn_on_control_entities()
+                return
+            if is_on and self.is_idle():
+                if self.is_sensor_on():
+                    # Someone is in the room and the light is on. Leaving EC in
+                    # 'idle' is NOT enough: the next sensor edge would call
+                    # sensor_on() on an already-on entity, which deliberately
+                    # lands in 'blocked' (block_timeout refreshed by every
+                    # further edge), so EC would never manage the light again
+                    # and a human has to turn it off.
+                    # Measured 2026-08-23: ec_105_e went blocked at 20:44 after
+                    # the relay came back on, was re-blocked by every kitchen PIR
+                    # edge, and Jan had to switch 1NP off by hand at 21:34.
+                    # force_activate() adopts the light instead: EC enters
+                    # 'active', starts its timer and turns the light off after
+                    # the delay once the room empties.
+                    self.log.info("resync :: on and a sensor is active — adopting it (force_activate)")
+                    self.force_activate()
+                    return
+                self.log.info("resync :: on, EC is idle and sensors are quiet — clearing stuck state")
+                self.turn_off_control_entities()
+            return
+        # -----------------------------------------------------------------
 
         #  If the state changed, we definitely want to handle the transition. If only attributes changed, we'll check if the new attributes are significant (i.e., not being ignored).
         try:
@@ -1055,9 +1119,40 @@ class Model:
     def is_override_state_on(self):
         return self._override_entity_state() is not None
 
+    def _hold_sensor_is_stuck(self, entity, state_obj):
+        """True when a hold sensor has been reporting ON for too long.
+
+        A wedged presence sensor would otherwise keep the timer alive forever
+        (expires_at: "pending sensor") and the light would never turn off. See
+        CONF_HOLD_MAX_SECONDS for the incident this guards against.
+        """
+        cap = getattr(self, "hold_max_seconds", None)
+        if not cap:
+            return False
+        try:
+            held_for = (
+                dt_util.utcnow() - state_obj.last_changed
+            ).total_seconds()
+        except (AttributeError, TypeError):
+            return False
+        if held_for < cap:
+            return False
+        self.log.warning(
+            "_sensor_entity_state :: hold sensor %s has been ON for %.0f s "
+            "(cap %s s) — treating it as stuck and ignoring it, otherwise the "
+            "timer would never start",
+            entity, held_for, cap,
+        )
+        return True
+
     def _sensor_entity_state(self):
-        # hold senzory se pocitaji stejne jako bezne — drzi timer (is_sensor_on)
-        for e in list(self.sensorEntities) + list(getattr(self, "holdSensorEntities", [])):
+        # Regular sensors first: they both trigger and hold, so they are always
+        # honoured. Hold sensors only hold, which makes it safe to ignore one
+        # that is obviously wedged (a stuck sensor in `sensors:` would just
+        # re-trigger, so the same treatment there would only cause flicker).
+        regular = list(self.sensorEntities)
+        holds = list(getattr(self, "holdSensorEntities", []))
+        for e in regular + holds:
             s = self.hass.states.get(e)
             try:
                 state = s.state
@@ -1071,6 +1166,8 @@ class Model:
                 continue
 
             if self.matches(state, self.SENSOR_ON_STATE):
+                if e in holds and e not in regular and self._hold_sensor_is_stuck(e, s):
+                    continue
                 self.log.debug("Sensor entities are ON. [%s]", e)
                 return e
         self.log.debug("Sensor entities are OFF.")
@@ -1396,14 +1493,16 @@ class Model:
             )
 
     def config_hold_sensor_entities(self, config):
-        """Senzory, ktere svetlo nezapinaji, ale drzi ho rozsvicene.
+        """Sensors that never switch the light on, but keep it on.
 
-        Motivace: 'zapni z PIR, drz z PIR + radaru'. Radar v `sensors:` by
-        svetlo rozsvecel i sam (a pri flapovani zbytecne blikal), proto ma
-        vlastni kategorii: do `_sensor_entity_state()` se pocita (takze drzi
-        timer pres is_sensor_on()), ale jeho zapnuti nikdy nevyvola aktivaci.
+        Rationale: "trigger from PIR, hold from PIR + radar". A radar listed
+        in `sensors:` would switch the light on by itself (and flicker it
+        needlessly while flapping), so it gets its own category: it counts
+        towards `_sensor_entity_state()` (thus holding the timer via
+        is_sensor_on()), but its on-edge never triggers activation.
         """
         self.holdSensorEntities = []
+        self.hold_max_seconds = config.get(CONF_HOLD_MAX_SECONDS, 7200)
         self.add(self.holdSensorEntities, config, CONF_HOLD_SENSORS)
         if self.holdSensorEntities:
             self.log.debug("Hold Sensor Entities: %s", pprint.pformat(self.holdSensorEntities))
@@ -1742,10 +1841,11 @@ class Model:
         data = {
             "state": self.state,
             "saved_at": str(datetime.now()),
-            # Cas dobehnuti timeru je potreba, aby se po restartu dalo
-            # dojezd dokoncit — jinak EC skonci v 'idle' a rizene svetlo
-            # uz nikdo nezhasne (mereno 2026-08-19: z 24 restartu zustalo
-            # 21x svetlo svitit, chvost po poslednim pohybu 20-40 min).
+            # The timer expiry time is needed so the run-out can be finished
+            # after a restart — otherwise EC ends up in 'idle' and nothing ever
+            # turns the controlled light off (measured 2026-08-19: out of 24
+            # restarts the light stayed on 21 times, with a 20-40 min tail
+            # after the last motion).
             "expires_at": str(self._expiry_time) if self._expiry_time else None,
         }
         self.log.debug("_async_save_state :: Saving state: %s", data)
@@ -1794,54 +1894,58 @@ class Model:
             return False
 
         if saved_state == "active_timer":
-            # Timer bezel, kdyz se HA vypinalo. Bez obnovy skonci EC v 'idle'
-            # a rizene svetlo uz nikdo nezhasne — jen novy pohyb cyklus
-            # dokonci. Mereno 2026-08-19 na produkci: z 24 restartu zustalo
-            # 21x svetlo svitit, chvost po poslednim pohybu 20-40 min misto
-            # ocekavanych ~5,5 min (hold 90 s + delay 240 s).
+            # The timer was running when HA shut down. Without restoring it EC
+            # ends up in 'idle' and nothing turns the controlled light off —
+            # only new motion completes the cycle. Measured 2026-08-19 in
+            # production: out of 24 restarts the light stayed on 21 times, with
+            # a 20-40 min tail after the last motion instead of the expected
+            # ~5.5 min (90 s hold + 240 s delay).
             expiry = self._parse_saved_expiry(data.get("expires_at"))
             if expiry is None:
                 return False
             if self._state_entities_unavailable():
-                # Rizena entita jeste nenabehla — zarovky za rele se hlasi
-                # pozdeji, nez EC startuje (STARTUP_DELAY = 70 s). PRAVE tohle
-                # je ten pripad, kdy se i povel z on_enter_idle ztrati a svetlo
-                # pak visi, takze to nesmime vzdat: rozhodnuti odlozime na
-                # _restore_timer_finish, ktery na entitu pocka.
+                # The controlled entity has not come up yet — bulbs behind a
+                # relay report later than EC starts (STARTUP_DELAY = 70 s).
+                # This is EXACTLY the case where even the on_enter_idle command
+                # is lost and the light then hangs on, so we must not give up:
+                # defer the decision to _restore_timer_finish, which waits for
+                # the entity.
                 self._pending_restore_expiry = expiry
                 self.log.info(
-                    "_async_restore_state :: Rizena entita jeste neni dostupna, "
-                    "odkladam rozhodnuti o dojezdu (expiry %s)", expiry)
+                    "_async_restore_state :: Controlled entity is not available yet, "
+                    "deferring the run-out decision (expiry %s)", expiry)
                 event.async_call_later(self.hass, 30, self._restore_timer_finish)
                 return False
             if not self.is_state_entities_on():
-                # Svetlo se mezitim zhaslo (rucne nebo jinou automatizaci) —
-                # neni co dokoncovat.
+                # The light was turned off meanwhile (manually or by another
+                # automation) — there is nothing to finish.
                 return False
-            zbyva = (expiry - datetime.now()).total_seconds()
-            if zbyva <= 1:
-                # POZOR: start_monitoring() smi byt jen tady, kde vracime True.
-                # Ve druhe vetvi vracime False a caller ho zavola sam — jinak
-                # by se zaregistroval dvakrat.
+            remaining = (expiry - datetime.now()).total_seconds()
+            if remaining <= 1:
+                # NOTE: start_monitoring() may only be called here, where we
+                # return True. The other branch returns False and the caller
+                # invokes it itself — otherwise it would register twice.
                 self.start_monitoring()
-                # Timer by vyprsel, zatimco HA nebezelo -> dokoncit zhasnuti.
+                # The timer would have expired while HA was down -> finish the
+                # turn-off.
                 self.log.info(
                     "_async_restore_state :: Timer expired while HA was down (%s), turning control entities off",
                     expiry)
                 self.turn_off_control_entities()
                 self.update(notes="Timer expired while HA was down — entities turned off")
                 return True
-            # Timer jeste nedobehl. Nesnazime se ho nasadit pres sensor_on() —
-            # ten pri uz svitici entite vede zamerne do 'blocked' (stejnou
-            # cestu pouziva i obnova blokace vyse). Misto toho necha EC bezet
-            # normalne a jen dokoncime to, co timer nedokoncil: po zbyvajicim
-            # case zhasnout, pokud EC mezitim nevzal rizeni na sebe.
+            # The timer has not run out yet. We do not try to re-arm it via
+            # sensor_on() — on an already-on entity that deliberately leads to
+            # 'blocked' (the same path the blocked-restore above uses). Instead
+            # EC keeps running normally and we only finish what the timer did
+            # not: turn off after the remaining time, unless EC has taken over
+            # control meanwhile.
             self._pending_restore_expiry = expiry
             self.log.info(
                 "_async_restore_state :: Timer from before restart has %.0f s left, scheduling turn-off",
-                zbyva)
-            self.update(notes="Timer from before restart: %.0f s left" % zbyva)
-            event.async_call_later(self.hass, zbyva, self._restore_timer_finish)
+                remaining)
+            self.update(notes="Timer from before restart: %.0f s left" % remaining)
+            event.async_call_later(self.hass, remaining, self._restore_timer_finish)
             return False
 
         # For all other states (idle, constrained, etc.) let the normal startup
@@ -1850,50 +1954,51 @@ class Model:
 
     @callback
     def _restore_timer_finish(self, _now=None):
-        """Dokonci zhasnuti, ktere melo provest timer bezici pred restartem.
+        """Finish the turn-off that the timer running before the restart owed.
 
-        Stoji mimo stavovy automat zamerne: kdyz je rizene svetlo pri startu
-        rozsvicene, EC skonci v 'blocked' (cizi ovladani) nebo 'idle' a samo
-        uz nezhasne. Pokud ale mezitim prisel pohyb a EC rizeni prevzal
-        (active_timer / overridden), nezasahujeme.
+        Deliberately outside the state machine: when the controlled light is on
+        at startup, EC ends up in 'blocked' (external control) or 'idle' and
+        never turns it off by itself. If motion arrived meanwhile and EC took
+        over control (active_timer / overridden), we do not interfere.
         """
         expiry = self._pending_restore_expiry
         if expiry is None:
             return
         if self.is_active_timer() or self.is_overridden():
             self._pending_restore_expiry = None
-            self.log.debug("_restore_timer_finish :: EC uz rizeni prevzal, nezasahuji")
+            self.log.debug("_restore_timer_finish :: EC has already taken over control, not interfering")
             return
-        # Klicovy pripad: pri inicializaci EC (STARTUP_DELAY) jsou zarovky za
-        # rele casto jeste 'unavailable', protoze localtuya/Tasmota nabiha
-        # pozdeji. EC v te chvili sice vstoupi do idle a posle turn_off, ale
-        # ten padne do prazdna; kdyz se svetlo pak objevi rozsvicene, EC to
-        # bere jako cizi ovladani a skonci v 'blocked' -> uz nikdy nezhasne.
-        # Proto tady na nedostupnou entitu cekame, misto abychom to vzdali.
+        # The key case: during EC initialisation (STARTUP_DELAY) bulbs behind a
+        # relay are often still 'unavailable', because localtuya/Tasmota come up
+        # later. EC does enter idle and send turn_off at that point, but the
+        # command goes nowhere; when the light then shows up on, EC treats it as
+        # external control and ends in 'blocked' -> it never turns off again.
+        # That is why we wait for an unavailable entity here instead of giving up.
         if self._state_entities_unavailable():
             if self._restore_retries < 10:
                 self._restore_retries += 1
                 self.log.debug(
-                    "_restore_timer_finish :: Rizena entita je nedostupna, zkusim znovu za 30 s (%d/10)",
+                    "_restore_timer_finish :: Controlled entity is unavailable, retrying in 30 s (%d/10)",
                     self._restore_retries)
                 event.async_call_later(self.hass, 30, self._restore_timer_finish)
             else:
                 self._pending_restore_expiry = None
                 self.log.warning(
-                    "_restore_timer_finish :: Rizena entita zustala nedostupna, vzdavam dojezd")
+                    "_restore_timer_finish :: Controlled entity stayed unavailable, giving up on the run-out")
             return
         if not self.is_state_entities_on():
             self._pending_restore_expiry = None
-            self.log.debug("_restore_timer_finish :: Svetlo uz nesviti, nic nedelam")
+            self.log.debug("_restore_timer_finish :: The light is no longer on, doing nothing")
             return
-        # Entita je dostupna a sviti. Kdyz timer jeste nedobehl (typicky kdyz
-        # jsme sem prisli z odlozeneho rozhodnuti po 30 s), pockame presne
-        # zbyvajici cas — jinak bychom zhasli driv, nez mel timer vyprset.
-        zbyva = (expiry - datetime.now()).total_seconds()
-        if zbyva > 1:
+        # The entity is available and on. If the timer has not run out yet
+        # (typically when we got here from the deferred decision after 30 s),
+        # wait exactly the remaining time — otherwise we would turn off earlier
+        # than the timer was due to expire.
+        remaining = (expiry - datetime.now()).total_seconds()
+        if remaining > 1:
             self.log.debug(
-                "_restore_timer_finish :: Entita je zpet, timeru zbyva %.0f s", zbyva)
-            event.async_call_later(self.hass, zbyva, self._restore_timer_finish)
+                "_restore_timer_finish :: Entity is back, timer has %.0f s left", remaining)
+            event.async_call_later(self.hass, remaining, self._restore_timer_finish)
             return
         self._pending_restore_expiry = None
         self.log.info("_restore_timer_finish :: Turning control entities off (timer from before restart)")
@@ -1901,7 +2006,7 @@ class Model:
         self.update(notes="Turned off by timer carried over the restart")
 
     def _state_entities_unavailable(self):
-        """True, kdyz aspon jedna rizena/stavova entita jeste neni k dispozici."""
+        """True when at least one controlled/state entity is not available yet."""
         for e in self.stateEntities:
             st = self.hass.states.get(e)
             if st is None or st.state in ("unavailable", "unknown"):

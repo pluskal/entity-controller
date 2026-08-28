@@ -30,11 +30,22 @@ SERVICE_SET_NIGHT_MODE = "set_night_mode"
 
 # Forced sensors (bypass blocked/constrained/overridden states)
 CONF_FORCED_SENSORS = "forced_sensors"
-# Senzory, ktere svetlo NEZAPINAJI, ale drzi ho rozsvicene (keep-alive).
-# Pouziti: zapnout z PIR (rychla, spolehliva hrana), drzet z PIR + radaru
-# (radar vidi i nehybneho cloveka). Radar v sensors: by svetlo rozsvecel
-# i pri svem flapovani — 103 radar prepina 54x/den, 16 % mezer <=60 s.
+# Sensors that NEVER switch the light on, but keep it on (keep-alive).
+# Use case: trigger from a PIR (fast, reliable edge), hold from PIR + radar
+# (a radar also sees a motionless person). A radar listed in sensors: would
+# switch the light on while flapping too — the 103 radar toggles 54x/day,
+# with 16 % of its gaps <= 60 s.
 CONF_HOLD_SENSORS = "hold_sensors"
+# Safety cap on how long a hold sensor may keep the timer alive. A hold sensor
+# that reports "occupied" forever (wedged mmWave radar) otherwise means the
+# light NEVER turns off — the timer never even starts, EC just reports
+# expires_at: "pending sensor".
+# Measured 2026-08-28: 203-presence (SNZB-06P) sat at occupancy=true for ~42 h
+# while still answering config writes and a z2m reconfigure; light.203_b was on
+# for 2 h 18 min until a human switched it off. Only a power-cycle cleared it.
+# Applies to hold sensors ONLY: a stuck sensor in `sensors:` would re-trigger
+# immediately, so ignoring it there would just make the light flicker.
+CONF_HOLD_MAX_SECONDS = "hold_max_seconds"
 
 # Event bus sensor support
 CONF_EVENT_SENSORS = "event_sensors"
