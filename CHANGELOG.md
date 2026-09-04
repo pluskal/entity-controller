@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+<a name="9.11.1"></a>
+## [9.11.1](https://github.com/pluskal/entity-controller/compare/v9.11.0...v9.11.1) (2026-09-04)
+
+
+### Bug Fixes
+
+* **lux-constraint** – A lux-blocked activation from `idle` is re-evaluated once after `lux_recheck_delay` seconds (default 1.0; `null` disables) while the sensor is still on. Integrations that publish occupancy and illuminance from one device message (Zigbee2MQTT + Aqara PIR) deliver them as two HA state changes whose order is not stable across restarts; when occupancy lands first the gate compared against the *previous* illuminance report – taken while the lights were still on – and refused to light a dark room (ec_204: 62 lx stale vs 6 lx fresh; ec_206: 37 vs 0). A genuinely bright room stays blocked.
+
+### Tests
+
+* `TestLuxConstraint` +8: re-check scheduled once per block (no stacking), not scheduled on a normal activation, re-check activates on a fresh dark reading, stays idle when still bright, no-ops when the sensor already dropped or the controller left `idle`, disabled by config, and the `lux_bright_states` flavour schedules it too.
+
 <a name="9.8.9"></a>
 ## [9.8.9](https://github.com/pluskal/entity-controller/compare/v9.8.8...v9.8.9) (2026-08-15)
 
