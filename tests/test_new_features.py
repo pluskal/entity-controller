@@ -265,6 +265,10 @@ def _build_model(hass=None, entity=None, config=None):
         m.luxEntity = None
         m.lux_threshold = None
         m.lux_bright_states = []
+        m.lux_recheck_delay = 1.0
+        m._lux_recheck_handle = None
+        m._lux_recheck_entity = None
+        m._lux_blocked = False
         m.night_mode_entity = None
         m.night_mode_entity_states = []
         m.nightControlEntities = []
@@ -1332,6 +1336,114 @@ class TestLuxConstraint:
         assert "is_state_entities_off" in _condition_names(gated[0]), (
             "The lux condition must gate the entities-off activation path"
         )
+
+
+    # -- stale-reading re-check (2026-09-04) --------------------------------
+
+    def _sensor_on_event(self):
+        ev = MagicMock()
+        ev.data = {
+            "entity_id": "binary_sensor.motion",
+            "old_state": MagicMock(state="off"),
+            "new_state": MagicMock(state="on", context=MagicMock(id="ctx-lux")),
+        }
+        return ev
+
+    def _states(self, model, lux, pir):
+        """hass.states.get returning the PIR for the sensor, lux otherwise."""
+        pir_obj = MagicMock(state=pir)
+        lux_obj = MagicMock(state=lux)
+        model.hass.states.get = MagicMock(
+            side_effect=lambda e: pir_obj if e == "binary_sensor.motion" else lux_obj
+        )
+
+    def test_blocked_activation_schedules_one_recheck(self):
+        """A lux-blocked sensor_on from idle schedules exactly one re-check,
+        even when the sensor fires again while it is pending."""
+        model = self._prepare(lux_state="450")
+        self._states(model, lux="450", pir="on")
+        with patch("custom_components.entity_controller.event.async_call_later") as later:
+            model.sensor_state_change(self._sensor_on_event())
+            assert model.state == "idle"
+            later.assert_called_once()
+            assert later.call_args[0][1] == 1.0
+            model.sensor_state_change(self._sensor_on_event())
+            later.assert_called_once()
+
+    def test_dark_activation_schedules_no_recheck(self):
+        """A normal activation must not leave a re-check behind."""
+        model = self._prepare(lux_state="30")
+        self._states(model, lux="30", pir="on")
+        with patch("custom_components.entity_controller.event.async_call_later") as later:
+            model.sensor_state_change(self._sensor_on_event())
+            assert model.state in ("active", "active_timer")
+            later.assert_not_called()
+
+    def test_recheck_activates_when_fresh_reading_is_dark(self):
+        """The late illuminance report says dark and the PIR is still on:
+        the re-check completes the activation the first pass refused."""
+        model = self._prepare(lux_state="450")
+        self._states(model, lux="450", pir="on")
+        with patch("custom_components.entity_controller.event.async_call_later"):
+            model.sensor_state_change(self._sensor_on_event())
+        assert model.state == "idle"
+        self._states(model, lux="6", pir="on")
+        model._lux_recheck(None)
+        assert model.state in ("active", "active_timer"), (
+            f"Expected activation on re-check at 6 lx, got {model.state}"
+        )
+        assert model._lux_recheck_handle is None
+
+    def test_recheck_keeps_bright_room_dark(self):
+        """A room that really is bright stays blocked after the re-check."""
+        model = self._prepare(lux_state="450")
+        self._states(model, lux="450", pir="on")
+        with patch("custom_components.entity_controller.event.async_call_later"):
+            model.sensor_state_change(self._sensor_on_event())
+        model._lux_recheck(None)
+        assert model.state == "idle"
+
+    def test_recheck_noop_when_sensor_already_off(self):
+        """No sensor on any more -> nothing to retry, even if it is dark now."""
+        model = self._prepare(lux_state="450")
+        self._states(model, lux="450", pir="on")
+        with patch("custom_components.entity_controller.event.async_call_later"):
+            model.sensor_state_change(self._sensor_on_event())
+        self._states(model, lux="6", pir="off")
+        model._lux_recheck(None)
+        assert model.state == "idle"
+
+    def test_recheck_noop_when_no_longer_idle(self):
+        """A re-check that fires after the controller moved on is ignored."""
+        model = self._prepare(lux_state="450")
+        self._states(model, lux="450", pir="on")
+        with patch("custom_components.entity_controller.event.async_call_later"):
+            model.sensor_state_change(self._sensor_on_event())
+        model.to_blocked()
+        self._states(model, lux="6", pir="on")
+        model._lux_recheck(None)
+        assert model.state == "blocked"
+
+    def test_recheck_disabled_by_config(self):
+        """lux_recheck_delay None keeps the pre-9.11.1 single-shot gate."""
+        model = self._prepare(lux_state="450")
+        self._states(model, lux="450", pir="on")
+        model.lux_recheck_delay = None
+        with patch("custom_components.entity_controller.event.async_call_later") as later:
+            model.sensor_state_change(self._sensor_on_event())
+            assert model.state == "idle"
+            later.assert_not_called()
+
+    def test_bright_states_block_also_schedules_recheck(self):
+        """The string-state flavour of the gate gets the same second look."""
+        model = self._prepare()
+        model.luxEntity = "sensor.radar_illumination"
+        model.lux_bright_states = ["bright"]
+        self._states(model, lux="bright", pir="on")
+        with patch("custom_components.entity_controller.event.async_call_later") as later:
+            model.sensor_state_change(self._sensor_on_event())
+            assert model.state == "idle"
+            later.assert_called_once()
 
 
 class TestLuxBrightStates:

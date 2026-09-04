@@ -55,6 +55,7 @@ CONF_EVENT_SENSOR_TYPE = "ha_event"  # sensor_type value for HA bus events
 CONF_LUX_ENTITY = "lux_entity"
 CONF_LUX_THRESHOLD = "lux_threshold"
 CONF_LUX_BRIGHT_STATES = "lux_bright_states"
+CONF_LUX_RECHECK_DELAY = "lux_recheck_delay"
 
 # State persistence
 STORAGE_VERSION = 1

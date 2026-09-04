@@ -122,6 +122,7 @@ from .const import (
     CONF_LUX_ENTITY,
     CONF_LUX_THRESHOLD,
     CONF_LUX_BRIGHT_STATES,
+    CONF_LUX_RECHECK_DELAY,
     STORAGE_VERSION,
     STORAGE_KEY_PREFIX,
 )
@@ -203,6 +204,7 @@ ENTITY_SCHEMA = vol.Schema(
         vol.Optional(CONF_LUX_ENTITY, default=None): vol.Any(None, cv.entity_id),
         vol.Optional(CONF_LUX_THRESHOLD, default=None): vol.Any(None, vol.Coerce(float)),
         vol.Optional(CONF_LUX_BRIGHT_STATES, default=[]): vol.All(cv.ensure_list, [cv.string]),
+        vol.Optional(CONF_LUX_RECHECK_DELAY, default=1.0): vol.Any(None, vol.Coerce(float)),
         vol.Optional(CONF_SERVICE_DATA, default=None): vol.Coerce(
             dict
         ),
@@ -641,6 +643,10 @@ class Model:
         self.luxEntity = None
         self.lux_threshold = None
         self.lux_bright_states = []
+        self.lux_recheck_delay = 1.0
+        self._lux_recheck_handle = None
+        self._lux_recheck_entity = None
+        self._lux_blocked = False
         self.night_mode_entity = None
         self.night_mode_entity_states = []
         self.nightControlEntities = []
@@ -752,6 +758,8 @@ class Model:
             self.set_context(new.context)
             self.update(last_triggered_by=entity)
             self.sensor_on()
+            if self.is_idle() and getattr(self, "_lux_blocked", False):
+                self._schedule_lux_recheck(entity)
 
         if (
             self.matches(new.state, self.SENSOR_OFF_STATE)
@@ -772,6 +780,59 @@ class Model:
                 # We only care about sensor off state changes when the sensor is a duration sensor and we are in active_timer state.
                 self.sensor_off_duration()
                 self.log.debug("sensor_state_change :: CONF_SENSOR_RESETS_TIMER - normal")
+
+    def _schedule_lux_recheck(self, entity):
+        """Give a lux-blocked activation one second look at the reading.
+
+        Integrations that publish occupancy and illuminance from a single
+        device message (Zigbee2MQTT + Aqara PIR) deliver them as two HA state
+        changes whose order is not stable across HA restarts. When the
+        occupancy change lands first, the constraint compares against the
+        *previous* illuminance report - typically taken while the lights were
+        still on - and blocks a legitimate activation in a dark room
+        (2026-09-04: ec_204 read 62 lx while the fresh report, 2 ms later,
+        said 6 lx; ec_206 the same with 37 lx). One re-check after
+        ``lux_recheck_delay`` seconds, with the sensor still on, picks up the
+        late reading. A room that really is bright stays blocked;
+        ``lux_recheck_delay: null`` disables the retry.
+        """
+        delay = getattr(self, "lux_recheck_delay", None)
+        if not delay:
+            return
+        if getattr(self, "_lux_recheck_handle", None) is not None:
+            return
+        self.log.debug(
+            "_schedule_lux_recheck :: activation by %s blocked on a possibly "
+            "stale lux reading; re-checking in %.1f s",
+            entity, delay,
+        )
+        self._lux_recheck_entity = entity
+        self._lux_recheck_handle = event.async_call_later(
+            self.hass, delay, self._lux_recheck
+        )
+
+    @callback
+    def _lux_recheck(self, _now=None):
+        """Retry the idle -> active transition once the lux entity caught up."""
+        self._lux_recheck_handle = None
+        if not self.is_idle():
+            return
+        triggered_by = getattr(self, "_lux_recheck_entity", None)
+        for e in self.sensorEntities:
+            s = self.hass.states.get(e)
+            if s is not None and self.matches(s.state, self.SENSOR_ON_STATE):
+                break
+        else:
+            self.log.debug(
+                "_lux_recheck :: no sensor is on any more; nothing to retry")
+            return
+        self.log.debug(
+            "_lux_recheck :: retrying activation, sensor %s is still on", e)
+        self.update(
+            last_triggered_by=triggered_by or e,
+            notes="Lux re-check after a possibly stale reading",
+        )
+        self.sensor_on()
 
     @callback
     def hold_sensor_state_change(self, event):
@@ -1227,6 +1288,7 @@ class Model:
         sensor is deliberate: a dead battery must degrade to pre-lux
         behaviour (lights turn on), never to a permanently dark room.
         """
+        self._lux_blocked = False
         if self.luxEntity is None:
             return True
         s = self.hass.states.get(self.luxEntity)
@@ -1259,6 +1321,7 @@ class Model:
                     value,
                     self.lux_threshold,
                 )
+                self._lux_blocked = True
                 self.update(lux_blocked_at=str(datetime.now()), lux_at_last_block=value)
                 return False
             self.log.debug(
@@ -1275,6 +1338,7 @@ class Model:
                 self.luxEntity,
                 state,
             )
+            self._lux_blocked = True
             self.update(lux_blocked_at=str(datetime.now()), lux_at_last_block=state)
             return False
         self.log.debug(
@@ -1748,6 +1812,14 @@ class Model:
         self.luxEntity = config.get(CONF_LUX_ENTITY, None)
         self.lux_threshold = config.get(CONF_LUX_THRESHOLD, None)
         self.lux_bright_states = config.get(CONF_LUX_BRIGHT_STATES, []) or []
+        # seconds before a lux-blocked activation is re-evaluated once (None/0
+        # disables); see _schedule_lux_recheck for the ordering race it covers
+        delay = config.get(CONF_LUX_RECHECK_DELAY, 1.0)
+        try:
+            self.lux_recheck_delay = float(delay) if delay else None
+        except (TypeError, ValueError):
+            self.log.error("lux_recheck_delay must be a number of seconds, got %r; using 1.0", delay)
+            self.lux_recheck_delay = 1.0
 
         if self.luxEntity is not None and self.lux_threshold is None \
                 and not self.lux_bright_states:
