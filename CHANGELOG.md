@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+<a name="9.11.2"></a>
+## [9.11.2](https://github.com/pluskal/entity-controller/compare/v9.11.1...v9.11.2) (2026-09-19)
+
+
+### Bug Fixes
+
+* **link-outage** – A controlled entity dropping to `unavailable` is now ignored (the timer keeps running) instead of being read as an external switch-off. Previously EC left `active_timer` for `idle` and fired a `turn_off` that the offline device never received; that doomed call armed the grace period, which then swallowed the device's `unavailable -> on` return, so the 9.11.0 resync never ran (2026-09-18 19:14:56: light.101_a, a localtuya relay, blinked out for 87 ms and burned for 39 minutes until `block_timeout`). The comeback resync is also evaluated *before* the ignored-context and grace-period checks – a return from `unavailable` is never EC's own echo, and whatever EC sent during the outage was lost anyway.
+
+### Tests
+
+* Add `TestLinkOutage` (10 tests): a drop keeps `active_timer` and makes no service call, is a no-op while idle and does not arm the grace period; a comeback adopts the light (sensor active), clears a stuck light (sensors quiet) or re-issues `turn_on` (timer running, came back off) even inside the grace period or behind the ignored-context filter; a comeback `on` during the timer is left alone; the 101_a incident replay; and an ordinary external `off` still reaches `control()`.
+
 <a name="9.11.1"></a>
 ## [9.11.1](https://github.com/pluskal/entity-controller/compare/v9.11.0...v9.11.1) (2026-09-04)
 
