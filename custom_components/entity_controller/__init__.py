@@ -936,14 +936,25 @@ class Model:
             str(old),
             str(new)
         )
-        if self.is_ignored_context(new.context):
-            self.log.debug("state_entity_state_change :: Ignoring this state change because it came from %s" % (new.context.id))
-            return
-        if self.is_within_grace_period():
-            self.log.debug("state_entity_state_change :: Ignoring this state change because we are within the grace period (until %s)", self.ignore_state_changes_until)
+        # --- Link outage (2026-09-19) --------------------------------------
+        # `unavailable` is not a state of the light, it is a lost link
+        # (localtuya blip; light.101_a dropped 10x in 14 days). Treating it as
+        # "switched off externally" made EC leave active_timer for idle and
+        # fire a turn_off the offline device never received — and that doomed
+        # call armed the grace period, which then swallowed the relay's return
+        # 87 ms later (2026-09-18 19:14:56: 101_a came back on, EC stayed
+        # idle, the light burned 39 min until block_timeout). So: ignore the
+        # drop, keep the timer running, and let the resync below deal with
+        # whatever the device reports when it returns.
+        if getattr(new, "state", None) == STATE_UNAVAILABLE:
+            self.log.info(
+                "state_entity_state_change :: %s became unavailable (EC state: %s) — ignoring, waiting for it to return",
+                str(entity), self.state,
+            )
             return
 
-        # --- Resync after unavailability (2026-08-23) ---------------------
+        # --- Resync after unavailability (2026-08-23, moved ahead of the
+        # grace-period check 2026-09-19: a comeback is never our own echo) --
         # A controlled entity (relay/light) dropped off WiFi and came back.
         # That is NOT manual control, so it must not be evaluated as external
         # control (it used to push EC into 'blocked', after which the timer
@@ -998,6 +1009,13 @@ class Model:
                 self.turn_off_control_entities()
             return
         # -----------------------------------------------------------------
+        if self.is_ignored_context(new.context):
+            self.log.debug("state_entity_state_change :: Ignoring this state change because it came from %s" % (new.context.id))
+            return
+        if self.is_within_grace_period():
+            self.log.debug("state_entity_state_change :: Ignoring this state change because we are within the grace period (until %s)", self.ignore_state_changes_until)
+            return
+
 
         #  If the state changed, we definitely want to handle the transition. If only attributes changed, we'll check if the new attributes are significant (i.e., not being ignored).
         try:

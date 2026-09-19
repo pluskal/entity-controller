@@ -1734,3 +1734,156 @@ class TestNightModeEntity:
         from custom_components.entity_controller import MODE_SCHEMA
         with pytest.raises(vol.Invalid):
             MODE_SCHEMA({"delay": 60})
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-19 – link outage of a controlled entity (unavailable round trip)
+# ---------------------------------------------------------------------------
+
+class TestLinkOutage:
+    """A controlled relay dropping to `unavailable` and returning.
+
+    Real incident 2026-09-18 19:14:56 (light.101_a, localtuya): the relay went
+    unavailable for 87 ms while ec_101 was in active_timer. EC treated the
+    drop as an external switch-off, went idle and fired a turn_off that the
+    offline device never received. That doomed call armed the grace period,
+    which then swallowed the relay's `unavailable -> on` return, so the
+    resync never ran and the light burned for 39 minutes. Two rules fix it:
+    a transition TO unavailable is ignored (the timer keeps running) and the
+    resync of a comeback is evaluated BEFORE the grace-period check.
+    """
+
+    def _event(self, old_state, new_state, entity_id="light.test"):
+        ev = MagicMock()
+        ev.data = {
+            "entity_id": entity_id,
+            "old_state": MagicMock(state=old_state, attributes={}),
+            "new_state": MagicMock(
+                state=new_state,
+                attributes={},
+                context=MagicMock(id="device-ctx"),
+            ),
+        }
+        return ev
+
+    def _active_timer_model(self):
+        model = _build_model()
+        model.is_state_entities_off = MagicMock(return_value=True)
+        model.is_state_entities_on = MagicMock(return_value=False)
+        model.will_stay_on = MagicMock(return_value=False)
+        model.sensor_on()
+        assert model.state == "active_timer"
+        model.is_ignored_context = MagicMock(return_value=False)
+        model.turn_on_control_entities = MagicMock()
+        model.turn_off_control_entities = MagicMock()
+        model.control = MagicMock()
+        return model
+
+    def _idle_model(self):
+        model = _build_model()
+        assert model.state == "idle"
+        model.is_ignored_context = MagicMock(return_value=False)
+        model.turn_on_control_entities = MagicMock()
+        model.turn_off_control_entities = MagicMock()
+        return model
+
+    def _arm_grace(self, model, seconds=5):
+        from datetime import timedelta
+        model.grace_period = seconds
+        model.ignore_state_changes_until = datetime.now() + timedelta(seconds=seconds)
+        assert model.is_within_grace_period() is True
+
+    # -- drop to unavailable ------------------------------------------------
+
+    def test_drop_to_unavailable_keeps_timer_running(self):
+        """on -> unavailable during active_timer: no transition, no service call."""
+        model = self._active_timer_model()
+        model.state_entity_state_change(self._event("on", "unavailable"))
+        assert model.state == "active_timer", (
+            f"Expected active_timer to survive the outage, got {model.state}"
+        )
+        model.control.assert_not_called()
+        model.turn_off_control_entities.assert_not_called()
+        model.turn_on_control_entities.assert_not_called()
+
+    def test_drop_to_unavailable_while_idle_is_ignored(self):
+        model = self._idle_model()
+        model.state_entity_state_change(self._event("off", "unavailable"))
+        assert model.state == "idle"
+        model.turn_off_control_entities.assert_not_called()
+
+    def test_drop_to_unavailable_does_not_arm_grace_period(self):
+        """The doomed turn_off is gone, so the grace period must not be armed."""
+        model = self._active_timer_model()
+        model.grace_period = 5
+        before = model.ignore_state_changes_until
+        model.state_entity_state_change(self._event("on", "unavailable"))
+        assert model.ignore_state_changes_until == before
+
+    # -- comeback vs grace period --------------------------------------------
+
+    def test_comeback_on_with_sensor_active_adopts_despite_grace_period(self):
+        """unavailable -> on, EC idle, sensor active, grace armed: force_activate."""
+        model = self._idle_model()
+        self._arm_grace(model)
+        model.is_sensor_on = MagicMock(return_value=True)
+        model.state_entity_state_change(self._event("unavailable", "on"))
+        assert model.state in ("active", "active_timer"), (
+            f"Expected adoption of the returned light, got {model.state}"
+        )
+        model.turn_off_control_entities.assert_not_called()
+
+    def test_comeback_on_with_sensors_quiet_turns_off_despite_grace_period(self):
+        """unavailable -> on, EC idle, room quiet, grace armed: clear the stuck light."""
+        model = self._idle_model()
+        self._arm_grace(model)
+        model.is_sensor_on = MagicMock(return_value=False)
+        model.state_entity_state_change(self._event("unavailable", "on"))
+        assert model.state == "idle"
+        model.turn_off_control_entities.assert_called_once()
+
+    def test_comeback_off_during_timer_turns_on_despite_grace_period(self):
+        """unavailable -> off while the timer runs: EC wants it on, turn it on."""
+        model = self._active_timer_model()
+        self._arm_grace(model)
+        model.state_entity_state_change(self._event("unavailable", "off"))
+        assert model.state == "active_timer"
+        model.turn_on_control_entities.assert_called_once()
+        model.control.assert_not_called()
+
+    def test_comeback_on_during_timer_is_left_alone(self):
+        model = self._active_timer_model()
+        model.state_entity_state_change(self._event("unavailable", "on"))
+        assert model.state == "active_timer"
+        model.turn_on_control_entities.assert_not_called()
+        model.turn_off_control_entities.assert_not_called()
+        model.control.assert_not_called()
+
+    def test_comeback_runs_before_ignored_context_check(self):
+        """A comeback is never EC's own echo; the context filter must not eat it."""
+        model = self._idle_model()
+        model.is_ignored_context = MagicMock(return_value=True)
+        model.is_sensor_on = MagicMock(return_value=False)
+        model.state_entity_state_change(self._event("unavailable", "on"))
+        model.turn_off_control_entities.assert_called_once()
+
+    def test_full_incident_replay(self):
+        """101_a on 2026-09-18: drop + return 87 ms later with the PIR still on.
+
+        Before the fix EC ended idle with the light on; now the timer survives
+        the drop and the comeback is a no-op for a running timer.
+        """
+        model = self._active_timer_model()
+        model.grace_period = 5
+        model.is_sensor_on = MagicMock(return_value=True)
+        model.state_entity_state_change(self._event("on", "unavailable"))
+        model.state_entity_state_change(self._event("unavailable", "on"))
+        assert model.state == "active_timer"
+        model.turn_off_control_entities.assert_not_called()
+        model.turn_on_control_entities.assert_not_called()
+
+    def test_ordinary_external_off_still_handled(self):
+        """Regression guard: a real off (not unavailable) still reaches control()."""
+        model = self._active_timer_model()
+        model.state_entity_state_change(self._event("on", "off"))
+        model.control.assert_called_once()
