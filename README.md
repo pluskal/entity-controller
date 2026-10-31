@@ -151,7 +151,7 @@ Semantics:
 
 ## State Persistence
 
-EC now persists the `overridden` and `blocked` states across Home Assistant restarts using the built-in HA storage layer. On startup the saved state is re-validated against the current live entity states before being applied, so stale persisted states are silently discarded.
+EC now persists the `overridden` and `blocked` states across Home Assistant restarts using the built-in HA storage layer. On startup the saved state is re-validated against the current live entity states before being applied, so stale persisted states are silently discarded. A restored `blocked` state leaves the lights as they are and re-arms the block timer, and a timer that was running resumes with the time it had left, again without touching the lights. If every state entity is off by then, EC starts in `idle`; if an override entity is on, EC starts in `overridden`, as on a normal start.
 
 No configuration is required — persistence is enabled automatically.
 
@@ -184,3 +184,24 @@ entity_controller:
 
 **When to use it:** Only needed for integrations where state-change events arrive with a context unrelated to the original EC service call (cloud integrations, gateway bridges, etc.). Standard local integrations — where HA propagates the service-call context through to the state-change event — are handled correctly by the existing context check and do not need this option.
 
+## State-Change Debounce (`state_change_debounce`)
+
+**Problem:** Some devices report a short `on -> off -> on` bounce (a relay re-reporting, a Wi-Fi blip) with a context that is not EC's own. EC read the first edge as manual control. In `active_timer` it went to `blocked`, or to `idle` (switching the lights off) if nothing else was on, or restarted the timer under `disable_block`. In `blocked`/`active_stay_on` the bounce of the last lit entity sent EC to `idle`, switching the light off.
+
+**Solution:** After an external change of a state entity in `active_timer`, `blocked` or `active_stay_on`, EC waits `state_change_debounce` seconds. It then compares every entity that changed with its state before the first change. If all of them are back, the change is ignored; otherwise EC reacts once, as before. The window starts at the first change, and later changes do not extend it.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `state_change_debounce` | number (seconds, 0-60) | `3` | How long an external change must persist before EC reacts. `0` or `null` reacts immediately (behaviour before 9.11.3). A boolean, a non-number, NaN or a value outside 0-60 logs an error and uses 3. |
+
+- Changes that EC already ignores never open the window: its own context or an `ignored_event_sources` match, `grace_period`, a drop to or return from `unavailable` (a return is resynced instead), and attributes listed in `state_attributes_ignore`.
+- When only attributes changed, attributes are compared. Once the state itself changed, only the state is.
+- An entity that is `unavailable` at the end of the window is judged by the last state it reported in the window. A removed entity is skipped.
+- The check is dropped if EC left the state. It is also dropped if `grace_period` is set and that grace period is still running at the deadline, which means EC called a service in the meantime.
+
+Known limits (set `0` on an instance where one of them matters):
+
+- A change made less than `state_change_debounce` seconds before the timer runs out is not seen; the timer turns the lights off.
+- A second bounce that straddles the end of the window still counts as a change.
+- An entity may return from `unavailable` inside the window while the timer runs. EC's resync then turns the lights back on, and the change is usually lost.
+- A Home Assistant restart inside the window drops the pending check.

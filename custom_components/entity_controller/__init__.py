@@ -123,6 +123,8 @@ from .const import (
     CONF_LUX_THRESHOLD,
     CONF_LUX_BRIGHT_STATES,
     CONF_LUX_RECHECK_DELAY,
+    CONF_STATE_CHANGE_DEBOUNCE,
+    DEFAULT_STATE_CHANGE_DEBOUNCE,
     STORAGE_VERSION,
     STORAGE_KEY_PREFIX,
 )
@@ -205,6 +207,9 @@ ENTITY_SCHEMA = vol.Schema(
         vol.Optional(CONF_LUX_THRESHOLD, default=None): vol.Any(None, vol.Coerce(float)),
         vol.Optional(CONF_LUX_BRIGHT_STATES, default=[]): vol.All(cv.ensure_list, [cv.string]),
         vol.Optional(CONF_LUX_RECHECK_DELAY, default=1.0): vol.Any(None, vol.Coerce(float)),
+        vol.Optional(CONF_STATE_CHANGE_DEBOUNCE, default=DEFAULT_STATE_CHANGE_DEBOUNCE): vol.Any(
+            None, vol.All(vol.Coerce(float), vol.Range(min=0, max=60))
+        ),
         vol.Optional(CONF_SERVICE_DATA, default=None): vol.Coerce(
             dict
         ),
@@ -251,6 +256,11 @@ async def async_setup(hass, config):
         source="pending",
         dest="idle",
     )
+    # Restoring a saved 'blocked' or a running timer with a light on: straight
+    # from pending, since the way through idle runs on_enter_idle, which
+    # switches the lights off. restore_active_timer(resume=<seconds left>).
+    machine.add_transition(trigger="restore_blocked", source="pending", dest="blocked")
+    machine.add_transition(trigger="restore_active_timer", source="pending", dest="active")
 
     machine.add_transition(trigger="constrain", source="*", dest="constrained")
     machine.add_transition(
@@ -594,6 +604,17 @@ class EntityController(entity.Entity):
         """EntityController will push its state to HA"""
         return False
 
+class _DebounceWindow:
+    """External state changes waiting for confirmation (Model._debounce_state_change)."""
+
+    __slots__ = ("state", "snapshot", "context", "handle")
+
+    def __init__(self, state):
+        self.state = state    # EC state the window was opened in
+        self.snapshot = {}    # entity_id -> [first old State or None, attribute-only so far, last State seen]
+        self.context = None   # context of the latest change; parent of EC's reaction
+        self.handle = None    # async_call_later cancel; never called
+
 class Model:
     """ Represents the transitions state machine model """
 
@@ -647,6 +668,8 @@ class Model:
         self._lux_recheck_handle = None
         self._lux_recheck_entity = None
         self._lux_blocked = False
+        self.state_change_debounce = DEFAULT_STATE_CHANGE_DEBOUNCE
+        self._debounce_window = None
         self.night_mode_entity = None
         self.night_mode_entity_states = []
         self.nightControlEntities = []
@@ -719,7 +742,9 @@ class Model:
         if wait == False:
             self.entity.do_update()
 
-    def finalize(self):
+    def finalize(self, *_args, **_kwargs):
+        # transitions passes a trigger's arguments to every callback
+        # (restore_active_timer(resume=...)).
         self.entity.do_update()
 
     # =====================================================
@@ -977,6 +1002,10 @@ class Model:
         except AttributeError:
             came_back = False
         if came_back:
+            # A pending debounce judges this entity by what it reports now.
+            window = self._debounce_window
+            if window is not None and entity in window.snapshot:
+                window.snapshot[entity][2] = new
             is_on = self.matches(new.state, self.CONTROL_ON_STATE)
             self.log.info(
                 "state_entity_state_change :: %s came back from unavailable as '%s' (EC state: %s) — resync",
@@ -1018,32 +1047,19 @@ class Model:
 
 
         #  If the state changed, we definitely want to handle the transition. If only attributes changed, we'll check if the new attributes are significant (i.e., not being ignored).
+        attr_only = False
         try:
-            if not old or not new or old == 'off' or new == 'off':
-                pass
-            else:
-                if old.state == new.state:  # Only attributes changed
-                    # Build two dictionaries of attributes, excluding the ones we don't want to monitor
-                    old_temp = {
-                        key: old.attributes[key]
-                        for key in old.attributes
-                        if key not in self.state_attributes_ignore
-                    }
-                    new_temp = {
-                        key: new.attributes[key]
-                        for key in new.attributes
-                        if key not in self.state_attributes_ignore
-                    }
-                    if old_temp == new_temp:
-                        self.log.debug("state_entity_state_change :: insignificant attribute change - Ignore the state change altogether")
-                        return
-                    self.log.debug("state_entity_state_change :: A significant attribute changed and will be handled")
+            attr_only = old is not None and old.state == new.state
+            if attr_only:
+                if self._significant_attributes(old) == self._significant_attributes(new):
+                    self.log.debug("state_entity_state_change :: insignificant attribute change - Ignore the state change altogether")
+                    return
+                self.log.debug("state_entity_state_change :: A significant attribute changed and will be handled")
         except AttributeError as a:
-            # Most likely one of the states, either new or old, is 'off', so there's no attributes dict attached to the state object.
-            self.log.debug(
-                "state_entity_state_change :: Most likely one of the states, either new or old, is 'off', so there's no attributes dict attached to the state object: "
-                + str(a)
-            )
+            attr_only = False
+            self.log.debug("state_entity_state_change :: cannot compare the two states, handling the change: %s", a)
+        if self._debounce_state_change(entity, old, new, attr_only):
+            return
         self.set_context(new.context)
         if self.is_active_timer():
             self.log.debug("state_entity_state_change :: We are in active timer and the state of observed state entities changed.")
@@ -1051,6 +1067,90 @@ class Model:
 
         if self.is_blocked() or self.is_active_stay_on(): # if statement required to avoid MachineErrors, cleaner than adding transitions to all possible states.
             self.enable()
+
+    def _significant_attributes(self, state):
+        return {
+            key: value for key, value in state.attributes.items()
+            if key not in self.state_attributes_ignore
+        }
+
+    def _debounce_state_change(self, entity, old, new, attr_only):
+        """Hold an external change for state_change_debounce seconds.
+
+        Returns False when the change is handled at once (debounce off, or a
+        state without a reaction). The deadline runs from the first change and
+        is not extended; _state_debounce_fire acts once if anything persisted.
+        """
+        if not self.state_change_debounce or self.state not in (
+            "active_timer", "blocked", "active_stay_on"
+        ):
+            return False
+        window = self._debounce_window
+        if window is None or window.state != self.state:
+            window = _DebounceWindow(self.state)
+            self._debounce_window = window
+            window.handle = event.async_call_later(
+                self.hass, self.state_change_debounce,
+                functools.partial(self._state_debounce_fire, window),
+            )
+            self.log.debug(
+                "state_entity_state_change :: %s changed in %s; acting only if it persists for %.1f s",
+                entity, self.state, self.state_change_debounce)
+        else:
+            self.log.debug("state_entity_state_change :: %s changed; check already pending", entity)
+        entry = window.snapshot.setdefault(entity, [old, attr_only, new])
+        entry[1] = entry[1] and attr_only
+        entry[2] = new
+        window.context = new.context
+        return True
+
+    @callback
+    def _state_debounce_fire(self, window, _now=None):
+        """Act once on the changes in window if any of them persisted."""
+        if self._debounce_window is not window:
+            return
+        self._debounce_window = None
+        if self.state != window.state:
+            self.log.debug("_state_debounce_fire :: EC left %s, dropping the change of %s", window.state, ", ".join(window.snapshot))
+            return
+        if self.is_within_grace_period():
+            self.log.info("_state_debounce_fire :: dropping the change of %s: EC called a service meanwhile (grace period)", ", ".join(window.snapshot))
+            return
+        result = {e: self._debounce_persisted(e, *entry) for e, entry in window.snapshot.items()}
+        gone = [e for e, r in result.items() if r is None]
+        back = [e for e, r in result.items() if r is not None and not r]
+        changed = [e for e, r in result.items() if r]
+        if gone:
+            self.log.info("_state_debounce_fire :: %s is gone - not compared", ", ".join(gone))
+        if not changed:
+            if back:
+                self.log.info("_state_debounce_fire :: %s is back to its previous state - ignoring the bounce (EC state: %s)", ", ".join(back), self.state)
+            return
+        self.log.info("_state_debounce_fire :: %s changed for good - handling it (EC state: %s)", ", ".join(changed), self.state)
+        self.set_context(window.context)
+        if self.state != window.state:
+            self.log.debug("_state_debounce_fire :: EC left %s meanwhile, not acting", window.state)
+        elif window.state == "active_timer":
+            self.control()
+        else:
+            self.enable()
+
+    def _debounce_persisted(self, entity, old, attr_only, last):
+        """True if entity still differs from its state before the window,
+        False if it is back, None if it is gone (not compared).
+
+        An unavailable entity is judged by the last state it reported in the
+        window: a real off followed by a link drop still counts.
+        """
+        cur = self.hass.states.get(entity)
+        if cur is not None and cur.state == STATE_UNAVAILABLE:
+            cur = last
+        if cur is None:
+            return None
+        old_state = getattr(old, "state", None)
+        if old_state is None or cur.state != old_state:
+            return True
+        return attr_only and self._significant_attributes(cur) != self._significant_attributes(old)
 
     @callback
     def forced_sensor_state_change(self, ev):
@@ -1101,7 +1201,9 @@ class Model:
         if self.is_idle() or self.is_active_timer() or self.is_blocked():
             self.sensor_on()
 
-    def _start_timer(self):
+    def _start_timer(self, delay=None):
+        """delay: run this many seconds instead of the configured delay
+        (a timer resumed after a restart)."""
         self.log.info("_start_timer :: Light params: " + str(self.lightParams))
         if self.backoff_count == 0:
             self.previous_delay = self.lightParams.get(CONF_DELAY, DEFAULT_DELAY)
@@ -1118,12 +1220,14 @@ class Model:
                 self.log.debug("Max backoff reached. Will not increase further.")
                 self.previous_delay = self.backoff_max
             self.update(delay=self.previous_delay)
+        if delay is None:
+            delay = self.previous_delay
 
-        expiry_time = datetime.now() + timedelta(seconds=self.previous_delay)
+        expiry_time = datetime.now() + timedelta(seconds=delay)
 
         # not able to use async_call_later because no known way to check whether timer is active.
         # self.timer_handle = event.async_call_later(self.hass, self.previous_delay, self.timer_expire)
-        self.timer_handle = Timer(self.previous_delay, self.timer_expire)
+        self.timer_handle = Timer(delay, self.timer_expire)
         self.timer_handle.start()
         self._expiry_time = expiry_time
         self.update(expires_at=expiry_time)
@@ -1422,6 +1526,7 @@ class Model:
     # =====================================================
     def on_enter_idle(self):
         self.log.debug("Entering idle")
+        self._debounce_window = None
         # Entering idle due to no events, set a new context with no parent
         self.set_context(None)
         self.do_transition_behaviour(CONF_ON_ENTER_IDLE)
@@ -1441,16 +1546,19 @@ class Model:
         self.do_transition_behaviour(CONF_ON_EXIT_OVERRIDDEN)
         self._schedule_save_state()
 
-    def on_enter_active(self):
+    def on_enter_active(self, resume=None):
+        """resume: seconds left on a timer restored after a restart
+        (restore_active_timer); the lights are then left as they are."""
         self.log.debug("Entering active")
         self.update(last_triggered_at=str(datetime.now()))
         self.backoff_count = 0
         self.prepare_service_data()
 
-        self._start_timer()
+        self._start_timer(resume)
 
         self.log.debug("on_enter_active :: light params before turning on: " + str(self.lightParams))
-        self.do_transition_behaviour(CONF_ON_ENTER_ACTIVE)
+        if resume is None:
+            self.do_transition_behaviour(CONF_ON_ENTER_ACTIVE)
         self.enter()
 
     def on_exit_active(self):
@@ -1461,6 +1569,15 @@ class Model:
             delay=self.lightParams.get(CONF_DELAY)
         )  # no need to update immediately
         self.do_transition_behaviour(CONF_ON_EXIT_ACTIVE)
+
+    # May run off the loop (threading.Timer worker, service executor): a single
+    # store, the loop-side fire then finds its window gone. No such hook for
+    # blocked: a sensor edge re-enters blocked and must not drop a pending check.
+    def on_exit_active_timer(self):
+        self._debounce_window = None
+
+    def on_exit_active_stay_on(self):
+        self._debounce_window = None
 
     def on_enter_blocked(self):
         self.log.debug("Entering blocked")
@@ -1880,6 +1997,19 @@ class Model:
 
         self.block_timeout = config.get(CONF_BLOCK_TIMEOUT, None)
         self.grace_period = config.get(CONF_IGNORE_STATE_CHANGES_UNTIL, None)
+        raw = config.get(CONF_STATE_CHANGE_DEBOUNCE, DEFAULT_STATE_CHANGE_DEBOUNCE)
+        try:
+            if isinstance(raw, bool):
+                raise ValueError(raw)
+            debounce = 0.0 if raw is None else float(raw)
+            if not 0 <= debounce <= 60:
+                raise ValueError(raw)
+        except (TypeError, ValueError, OverflowError):
+            self.log.error(
+                "state_change_debounce must be 0-60 seconds or null, got %r; using %s",
+                raw, DEFAULT_STATE_CHANGE_DEBOUNCE)
+            debounce = DEFAULT_STATE_CHANGE_DEBOUNCE
+        self.state_change_debounce = debounce or None
         self.disable_block = config.get(CONF_DISABLE_BLOCK, False)
         self.image_prefix = config.get("image_prefix", "/fsm_diagram_")
         self.image_path = config.get("image_path", "/conf/temp")
@@ -1977,9 +2107,14 @@ class Model:
         if saved_state == "blocked":
             # Only restore blocked if the state entity is still on (otherwise the
             # entity was turned off while HA was down — go to idle instead).
+            # Straight from pending (2026-10-31): the old way through idle ran
+            # on_enter_idle, which switched every light off and left EC blocked
+            # in the dark. set_context() replaces the one on_enter_idle set.
+            if len(self.overrideEntities) > 0 and self.is_override_state_on():
+                return False  # the caller enters overridden, as on a normal start
             if self.is_state_entities_on() and self.is_block_enabled():
-                self.start_monitoring()
-                self.sensor_on()  # triggers idle→active→blocked via normal transitions
+                self.set_context(None)
+                self.restore_blocked()
                 return True
             return False
 
@@ -2010,6 +2145,8 @@ class Model:
                 # The light was turned off meanwhile (manually or by another
                 # automation) — there is nothing to finish.
                 return False
+            if len(self.overrideEntities) > 0 and self.is_override_state_on():
+                return False  # the caller enters overridden, as on a normal start
             remaining = (expiry - datetime.now()).total_seconds()
             if remaining <= 1:
                 # NOTE: start_monitoring() may only be called here, where we
@@ -2024,19 +2161,19 @@ class Model:
                 self.turn_off_control_entities()
                 self.update(notes="Timer expired while HA was down — entities turned off")
                 return True
-            # The timer has not run out yet. We do not try to re-arm it via
-            # sensor_on() — on an already-on entity that deliberately leads to
-            # 'blocked' (the same path the blocked-restore above uses). Instead
-            # EC keeps running normally and we only finish what the timer did
-            # not: turn off after the remaining time, unless EC has taken over
-            # control meanwhile.
-            self._pending_restore_expiry = expiry
+            # The timer has not run out yet: resume it with the time it had
+            # left, straight from pending and without turning anything on
+            # (2026-10-31). Not via sensor_on(), which on an already-on entity
+            # leads to 'blocked'; and no longer by returning False, which let
+            # the caller's start_monitoring() run on_enter_idle and switch the
+            # lights off in an occupied room right at startup.
             self.log.info(
-                "_async_restore_state :: Timer from before restart has %.0f s left, scheduling turn-off",
+                "_async_restore_state :: Timer from before restart has %.0f s left, resuming it",
                 remaining)
+            self.set_context(None)
+            self.restore_active_timer(resume=remaining)
             self.update(notes="Timer from before restart: %.0f s left" % remaining)
-            event.async_call_later(self.hass, remaining, self._restore_timer_finish)
-            return False
+            return True
 
         # For all other states (idle, constrained, etc.) let the normal startup
         # evaluation run.

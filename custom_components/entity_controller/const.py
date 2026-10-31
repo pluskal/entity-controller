@@ -57,6 +57,12 @@ CONF_LUX_THRESHOLD = "lux_threshold"
 CONF_LUX_BRIGHT_STATES = "lux_bright_states"
 CONF_LUX_RECHECK_DELAY = "lux_recheck_delay"
 
+# Seconds an external change of a state entity must persist before EC acts on
+# it; 0/null acts at once. 2026-10-30: light.108_i went off for 88 ms and put
+# ec_108f from active_timer into blocked for over two hours.
+CONF_STATE_CHANGE_DEBOUNCE = "state_change_debounce"
+DEFAULT_STATE_CHANGE_DEBOUNCE = 3.0
+
 # State persistence
 STORAGE_VERSION = 1
 STORAGE_KEY_PREFIX = "entity_controller_state_"
