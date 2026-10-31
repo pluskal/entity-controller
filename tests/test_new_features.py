@@ -32,6 +32,7 @@ def _make_hass():
         if asyncio.iscoroutine(coro):
             coro.close()
     hass.async_create_task = MagicMock(side_effect=_safe_create_task)
+    hass.is_stopping = False
     return hass
 
 
@@ -184,7 +185,7 @@ def _add_machine_transitions(machine):
     # Phase 3: force_activate bypasses all states
     machine.add_transition(
         trigger="force_activate",
-        source=["idle", "blocked", "constrained", "overridden", "active_timer"],
+        source=["pending", "idle", "blocked", "constrained", "overridden", "active_timer"],
         dest="active",
     )
 
@@ -283,6 +284,8 @@ def _build_model(hass=None, entity=None, config=None):
         m.grace_period = None
         m.ignore_state_changes_until = datetime.now()
         m.homeassistant_turn_on_domains = ["group"]
+        m._expiry_time = None
+        m._restore_wait = None
 
         DEFAULT_ON = ["on", "playing", "home", "True"]
         DEFAULT_OFF = ["off", "idle", "paused", "away", "False"]
@@ -748,9 +751,15 @@ class TestStatePersistence:
 
     NO_SAVE = "custom_components.entity_controller.asyncio.run_coroutine_threadsafe"
     LATER = "custom_components.entity_controller.event.async_call_later"
+    TRACK = "custom_components.entity_controller.event.async_track_state_change_event"
 
     def _restore_model(self, saved, live):
-        """A model still in pending (startup) with `saved` in its store."""
+        """A model still in pending (startup) with `saved` in its store.
+
+        `live` maps entity -> state (None = not created yet) and is read on
+        every lookup, so a test can change it later. The motion sensor
+        reports 'off' unless `live` says otherwise."""
+        live.setdefault("binary_sensor.motion", "off")
         model = _build_model()
         model.to_pending()
         model.context = None  # production: nothing sets it before the restore
@@ -760,7 +769,7 @@ class TestStatePersistence:
         model.turn_on_control_entities = MagicMock()
         model.turn_off_control_entities = MagicMock()
         model.hass.states.get = MagicMock(
-            side_effect=lambda e: MagicMock(state=live[e]) if e in live else None)
+            side_effect=lambda e: MagicMock(state=live[e]) if live.get(e) is not None else None)
         store = AsyncMock()
         store.async_load = AsyncMock(return_value=saved)
         model._store = store
@@ -779,12 +788,56 @@ class TestStatePersistence:
         return model, expiry
 
     def _restore(self, model):
-        """Run the restore; returns (result, Timer mock, async_call_later mock)."""
+        """Run the restore; returns (result, Timer mock, async_call_later mock).
+        The state-listener mock is kept in self.track."""
         with patch("custom_components.entity_controller.Timer") as timer, patch(
             self.NO_SAVE, side_effect=lambda coro, loop: coro.close()
-        ), patch(self.LATER) as later:
+        ), patch(self.LATER) as later, patch(self.TRACK) as track:
             result = asyncio.run(model._async_restore_state())
+        self.track = track
         return result, timer, later
+
+    def _later(self, fn, *args):
+        """Run fn (a wait event or timeout, a trigger) with Timer, saves and
+        listeners patched; returns the Timer mock."""
+        with patch("custom_components.entity_controller.Timer") as timer, patch(
+            self.NO_SAVE, side_effect=lambda coro, loop: coro.close()
+        ), patch(self.LATER), patch(self.TRACK):
+            fn(*args)
+        return timer
+
+    @staticmethod
+    def _ev(entity, old, new):
+        ev = MagicMock()
+        ev.data = {"entity_id": entity,
+                   "old_state": None if old is None else MagicMock(state=old),
+                   "new_state": None if new is None else MagicMock(state=new)}
+        return ev
+
+    def _waiting_model(self, expires_in, lights, sensor="on", overrides=()):
+        """A restore that waits in pending; returns (model, live, expiry, later)."""
+        live = {"binary_sensor.motion": sensor, **lights}
+        model, expiry = self._timer_restore_model(expires_in, live)
+        model.overrideEntities = list(overrides)
+        del model._start_timer
+        result, timer, later = self._restore(model)
+        assert result is True and model.state == "pending"
+        assert model._restore_wait is not None
+        timer.assert_not_called()
+        model.hass.services.async_call.assert_not_called()
+        model.turn_off_control_entities.assert_not_called()
+        return model, live, expiry, later
+
+    def _resumed_for_a_silent_sensor(self):
+        live = {"light.a": "on", "light.b": "on", "binary_sensor.motion": "unknown"}
+        model, _ = self._timer_restore_model(-600, live)
+        model.sensor_type = "duration"
+        model.config["sensor_resets_timer"] = True
+        del model._start_timer
+        del model.turn_off_control_entities
+        result, _, _ = self._restore(model)
+        assert result is True and model.state == "active_timer"
+        return model, live
 
     def test_async_restore_blocked_with_a_light_on_leaves_it_on(self):
         """A restored block keeps the lights as they are and re-arms the block
@@ -856,12 +909,14 @@ class TestStatePersistence:
             later.assert_not_called()
         assert model.state == "active_timer"
 
-    def test_async_restore_timer_with_time_left_resumes_it(self):
+    def test_async_restore_timer_with_time_left_resumes_it(self, caplog):
         """A running timer resumes with the time it had left and the lights
-        untouched. Before 9.11.3 the restore returned False and the caller's
-        start_monitoring() switched the lights off in on_enter_idle."""
-        model, expiry = self._timer_restore_model(3600, {"light.a": "on", "light.b": "off"})
+        untouched. No ERROR log: finalize() takes the trigger's resume=...
+        argument; transitions only logs a finalize that does not."""
+        caplog.set_level(logging.ERROR)
+        model, expiry = self._timer_restore_model(150, {"light.a": "on", "light.b": "off"})
         del model._start_timer  # the real timer bookkeeping, Timer patched
+        model.entity.do_update.reset_mock()
         result, timer, later = self._restore(model)
         assert result is True
         assert model.state == "active_timer"
@@ -870,13 +925,16 @@ class TestStatePersistence:
         model.hass.services.async_call.assert_not_called()
         timer.assert_called_once()
         delay, expire_cb = timer.call_args[0]
-        assert 3000 < delay <= 3600  # the time left, not the configured 180 s
+        assert 140 < delay <= 150  # the time left, not the configured 180 s
         assert expire_cb == model.timer_expire
         timer.return_value.start.assert_called_once()
-        assert abs((model._expiry_time - expiry).total_seconds()) < 600
-        assert getattr(model, "_pending_restore_expiry", None) is None
+        assert abs((model._expiry_time - expiry).total_seconds()) < 10
+        assert model._restore_wait is None
         later.assert_not_called()
+        self.track.assert_not_called()
         assert model.context.id.startswith("ec_")
+        assert model.entity.do_update.called
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
     def test_restored_timer_runs_out_with_ec_context(self):
         model, _ = self._timer_restore_model(3600, {"light.a": "on", "light.b": "on"})
@@ -890,25 +948,33 @@ class TestStatePersistence:
         assert [c.args[1] for c in calls] == ["turn_off", "turn_off"]
         assert all(c.kwargs["context"].id.startswith("ec_") for c in calls)
 
-    def test_async_restore_timer_waits_for_an_unavailable_entity(self):
-        """Unchanged (9.9.1): an entity that is not up yet defers the decision."""
-        model, expiry = self._timer_restore_model(
-            3600, {"light.a": "unavailable", "light.b": "on"})
+    @pytest.mark.parametrize("missing", ["unavailable", "unknown", None])
+    def test_async_restore_timer_resumes_with_an_unreachable_light(self, missing):
+        """A light that has not reported yet no longer sends EC through idle,
+        which switched the reachable lights off (9.9.1)."""
+        model, _ = self._timer_restore_model(150, {"light.a": missing, "light.b": "on"})
+        del model._start_timer
         result, timer, later = self._restore(model)
-        assert result is False
-        assert model.state == "pending"
-        assert model._pending_restore_expiry == expiry
-        later.assert_called_once_with(model.hass, 30, model._restore_timer_finish)
-        timer.assert_not_called()
+        assert result is True and model.state == "active_timer"
+        model.turn_off_control_entities.assert_not_called()
+        model.hass.services.async_call.assert_not_called()
+        assert 140 < timer.call_args[0][0] <= 150
+        assert model._restore_wait is None
+        later.assert_not_called()
+        self.track.assert_not_called()
 
-    def test_async_restore_expired_timer_turns_off(self):
-        """Unchanged: a timer that ran out while HA was down is finished."""
+    @pytest.mark.parametrize("on_enter_idle", ["off", "ignore", "on"])
+    def test_async_restore_expired_timer_turns_off_once(self, on_enter_idle):
+        """Ran out while HA was down, every sensor off: each light is switched
+        off exactly once (9.11.3: twice), whatever on_enter_idle says."""
         model, _ = self._timer_restore_model(-60, {"light.a": "on", "light.b": "on"})
+        model.transition_behaviours["on_enter_idle"] = on_enter_idle
         result, timer, _ = self._restore(model)
-        assert result is True
-        assert model.state == "idle"
-        model.turn_off_control_entities.assert_called()
+        assert result is True and model.state == "idle"
+        model.turn_off_control_entities.assert_called_once()
+        model.turn_on_control_entities.assert_not_called()
         timer.assert_not_called()
+        assert model.context.id.startswith("ec_")
 
     def test_async_restore_timer_with_lights_off_goes_idle(self):
         """Unchanged: nothing left to finish."""
@@ -918,6 +984,7 @@ class TestStatePersistence:
         assert model.state == "pending"
         later.assert_not_called()
         timer.assert_not_called()
+        self.track.assert_not_called()
 
     @pytest.mark.parametrize("expires_in", [3600, -60], ids=["time-left", "expired"])
     def test_async_restore_timer_defers_to_an_override_that_is_on(self, expires_in):
@@ -932,6 +999,364 @@ class TestStatePersistence:
             model.override()  # what startup_delay_callback does with an override on
         assert model.state == "overridden"
         model.turn_off_control_entities.assert_not_called()
+
+    def test_async_restore_expired_timer_with_a_light_unreachable_turns_off_once(self):
+        model, _ = self._timer_restore_model(-60, {"light.a": "on", "light.b": "unavailable"})
+        result, timer, _ = self._restore(model)
+        assert result is True and model.state == "idle"
+        model.turn_off_control_entities.assert_called_once()
+        timer.assert_not_called()
+        self.track.assert_not_called()
+
+    @pytest.mark.parametrize("holder", ["sensor", "hold"])
+    def test_async_restore_expired_timer_held_by_a_sensor_resumes_the_delay(self, holder):
+        """The timer ran out while a sensor or hold sensor held the light
+        ('pending sensor'): resume the delay, lights untouched (9.11.3 switched
+        the occupied room dark)."""
+        live = {"light.a": "on", "light.b": "on",
+                "binary_sensor.motion": "on" if holder == "sensor" else "off",
+                "binary_sensor.hold": "on" if holder == "hold" else "off"}
+        model, _ = self._timer_restore_model(-600, live)
+        model.holdSensorEntities = ["binary_sensor.hold"]
+        del model._start_timer
+        result, timer, _ = self._restore(model)
+        assert result is True and model.state == "active_timer"
+        model.turn_off_control_entities.assert_not_called()
+        model.hass.services.async_call.assert_not_called()
+        assert timer.call_args[0][0] == 180
+
+    @pytest.mark.parametrize("motion,hold", [("unknown", "off"), ("unavailable", "off"), (None, "off"),
+                                             ("off", "unknown")],
+                             ids=["unknown", "unavailable", "None", "hold-unknown"])
+    def test_async_restore_expired_timer_with_a_silent_sensor_resumes_the_delay(self, motion, hold, caplog):
+        """Also: a sensor not created yet is 'not reported', without the
+        'does not exist (yet)' ERROR of is_sensor_on(); a hold sensor that
+        has not reported holds the light like a regular one."""
+        caplog.set_level(logging.ERROR)
+        model, _ = self._timer_restore_model(
+            -600, {"light.a": "on", "light.b": "on", "binary_sensor.motion": motion, "binary_sensor.hold": hold})
+        model.holdSensorEntities = ["binary_sensor.hold"]
+        del model._start_timer
+        result, timer, _ = self._restore(model)
+        assert result is True and model.state == "active_timer"
+        model.turn_off_control_entities.assert_not_called()
+        model.turn_on_control_entities.assert_not_called()
+        model.hass.services.async_call.assert_not_called()
+        assert timer.call_args[0][0] == 180
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    @pytest.mark.parametrize("night,expected", [(True, 240), (False, 60)], ids=["night", "day"])
+    def test_async_restore_expired_timer_resumes_the_delay_of_the_mode(self, night, expected):
+        model, _ = self._timer_restore_model(
+            -600, {"light.a": "on", "light.b": "on", "binary_sensor.motion": "unknown"})
+        model.light_params_day = {"delay": 60, "service_data": None, "service_data_off": None}
+        model.light_params_night = {"delay": 240, "service_data": None, "service_data_off": None}
+        model.night_mode = {"delay": 240}
+        model.is_night = MagicMock(return_value=night)
+        del model._start_timer
+        result, timer, _ = self._restore(model)
+        assert result is True
+        assert timer.call_args[0][0] == expected
+
+    def test_resumed_delay_is_held_by_a_late_sensor_report(self):
+        model, live = self._resumed_for_a_silent_sensor()
+        live["binary_sensor.motion"] = "on"
+        timer = self._later(model.sensor_state_change, self._ev("binary_sensor.motion", "unknown", "on"))
+        timer.assert_called_once()  # the timer restarts
+        self._later(model.timer_expire)
+        assert model.state == "active_timer"  # 'pending sensor'
+        model.hass.services.async_call.assert_not_called()
+
+    def test_resumed_delay_runs_out_without_a_sensor_report(self):
+        model, _ = self._resumed_for_a_silent_sensor()
+        self._later(model.timer_expire)
+        assert model.state == "idle"
+        calls = model.hass.services.async_call.call_args_list
+        assert [c.args[1] for c in calls] == ["turn_off", "turn_off"]
+        assert all(c.kwargs["context"].id.startswith("ec_") for c in calls)
+
+    @pytest.mark.parametrize("sensor,low,high", [("unknown", 180, 180), ("off", 5, 10), ("on", 5, 10)])
+    def test_async_restore_timer_with_little_time_left(self, sensor, low, high):
+        model, _ = self._timer_restore_model(
+            10, {"light.a": "on", "light.b": "on", "binary_sensor.motion": sensor})
+        del model._start_timer
+        result, timer, _ = self._restore(model)
+        assert result is True and model.state == "active_timer"
+        assert low <= timer.call_args[0][0] <= high
+
+    @pytest.mark.parametrize("day,night,backoff,expected", [
+        (180, None, None, 180), (60, 240, None, 240), (60, None, 600, 600), (60, 240, False, 240),
+    ], ids=["day", "night-counts-by-day", "backoff-max", "backoff-off"])
+    def test_async_restore_caps_the_resumed_time(self, day, night, backoff, expected):
+        """A saved run-out an hour ahead (DST fall-back, clock step) resumes at
+        most the longest timer the instance can run."""
+        model, _ = self._timer_restore_model(3650, {"light.a": "on", "light.b": "on"})
+        model.light_params_day = {"delay": day, "service_data": None, "service_data_off": None}
+        if night is not None:
+            model.night_mode = {"delay": night}
+            model.light_params_night = {"delay": night, "service_data": None, "service_data_off": None}
+        if backoff is not None:
+            model.backoff = bool(backoff)
+            model.backoff_max = backoff or 7200
+        model.is_night = MagicMock(return_value=False)
+        del model._start_timer
+        result, timer, _ = self._restore(model)
+        assert result is True
+        assert timer.call_args[0][0] == expected
+
+    def test_async_restore_with_no_light_reachable_waits_in_pending(self):
+        model, _, expiry, later = self._waiting_model(150, {"light.a": "unavailable", "light.b": "unknown"})
+        assert model._restore_wait.expiry == expiry
+        hass, entities, job = self.track.call_args[0]
+        assert hass is model.hass and entities == ["light.a", "light.b"]
+        assert job.func == model._restore_wait_event and job.args == (model._restore_wait,)
+        later.assert_called_once()
+        assert later.call_args[0][:2] == (model.hass, 300)
+
+    def test_async_restore_with_the_reachable_lights_off_waits(self):
+        self._waiting_model(150, {"light.a": "off", "light.b": "unavailable"})
+
+    @pytest.mark.parametrize("old", ["unavailable", "unknown", None])
+    def test_wait_resumes_when_a_light_comes_back_on(self, old):
+        model, live, _, later = self._waiting_model(150, {"light.a": old, "light.b": "unavailable"})
+        wait, unsub = model._restore_wait, self.track.return_value
+        live["light.a"] = "on"
+        timer = self._later(model._restore_wait_event, wait, self._ev("light.a", old, "on"))
+        assert model.state == "active_timer"
+        assert 140 < timer.call_args[0][0] <= 150
+        model.hass.services.async_call.assert_not_called()
+        assert model._restore_wait is None
+        unsub.assert_called_once()
+        later.return_value.assert_called_once()
+
+    @pytest.mark.parametrize("sensor", ["off", "on"])
+    def test_wait_applies_the_restore_rules_at_the_comeback(self, sensor):
+        model, live, _, _ = self._waiting_model(
+            -60, {"light.a": "unavailable", "light.b": "unavailable"}, sensor=sensor)
+        live["light.a"] = "on"
+        timer = self._later(model._restore_wait_event, model._restore_wait,
+                            self._ev("light.a", "unavailable", "on"))
+        if sensor == "off":
+            assert model.state == "idle"
+            model.turn_off_control_entities.assert_called_once()
+            timer.assert_not_called()
+        else:
+            assert model.state == "active_timer"
+            model.turn_off_control_entities.assert_not_called()
+            assert timer.call_args[0][0] == 180
+
+    @pytest.mark.parametrize("debounce", [3.0, None], ids=["settled", "no-debounce"])
+    def test_wait_ends_in_idle_without_turn_off_when_the_lights_come_back_off(self, debounce):
+        """Once every light has stayed off for state_change_debounce (none: at once)."""
+        model, live, _, _ = self._waiting_model(
+            150, {"light.a": "unavailable", "light.b": "unavailable"}, sensor="off")
+        model.state_change_debounce = debounce
+        wait = model._restore_wait
+        live["light.a"] = "off"
+        self._later(model._restore_wait_event, wait, self._ev("light.a", "unavailable", "off"))
+        assert model.state == "pending" and model._restore_wait is wait  # light.b is still unavailable
+        live["light.b"] = "off"
+        self._later(model._restore_wait_event, wait, self._ev("light.b", "unavailable", "off"))
+        if debounce:
+            assert model.state == "pending" and model._restore_wait is wait
+            self._later(model._restore_wait_settled, wait)
+        assert model.state == "idle" and model._restore_wait is None
+        model.turn_off_control_entities.assert_not_called()
+        model.turn_on_control_entities.assert_not_called()
+
+    @pytest.mark.parametrize("old,new", [("on", "unavailable"), ("unavailable", "unknown"), ("unavailable", None),
+                                         ("off", "on")],
+                             ids=["drop", "still-unknown", "removed", "manual-on"])
+    def test_wait_ignores_changes_that_are_not_a_comeback(self, old, new):
+        """Also a reachable light switched on by hand: evaluated after the
+        run-out with every sensor off, it would be switched off again."""
+        manual = old == "off"
+        model, live, _, _ = self._waiting_model(
+            -60 if manual else 150,
+            {"light.a": "off" if manual else "unavailable", "light.b": "unavailable"},
+            sensor="off" if manual else "on")
+        wait = model._restore_wait
+        live["light.a" if manual else "light.b"] = "on"  # would settle the timer if the event were evaluated
+        self._later(model._restore_wait_event, wait, self._ev("light.a", old, new))
+        assert model.state == "pending" and model._restore_wait is wait
+        model.turn_off_control_entities.assert_not_called()
+
+    @pytest.mark.parametrize("then,sensor", [("comeback", "off"), ("override-attribute", "off"), ("comeback", "on")],
+                             ids=["comeback", "override-attribute", "comeback-sensor-on"])
+    def test_wait_never_switches_off_a_light_switched_on_during_it(self, then, sensor):
+        """A light switched on during the wait (by hand, an automation) is
+        external control: the next evaluation ends the wait in idle without
+        a turn-off, as at runtime (blocked when a sensor is on)."""
+        model, live, _, _ = self._waiting_model(
+            -60, {"light.a": "off", "light.b": "unavailable", "input_boolean.ov": "off"}, sensor=sensor,
+            overrides=["input_boolean.ov"])
+        wait = model._restore_wait
+        live["light.a"] = "on"
+        self._later(model._restore_wait_event, wait, self._ev("light.a", "off", "on"))
+        assert model.state == "pending" and model._restore_wait is wait
+        if then == "comeback":
+            live["light.b"] = "off"
+            self._later(model._restore_wait_event, wait, self._ev("light.b", "unavailable", "off"))
+        else:
+            self._later(model._restore_wait_event, wait, self._ev("input_boolean.ov", "off", "off"))
+        assert model._restore_wait is None
+        model.turn_off_control_entities.assert_not_called()
+        assert model.state == ("blocked" if sensor == "on" else "idle")
+
+    @pytest.mark.parametrize("case", ["off", "unknown", "late"])
+    def test_wait_settles_a_light_that_comes_back_off_then_on(self, case):
+        """Tasmota lights come back 'off' and report their real state 1-2 s
+        later. Within state_change_debounce of its comeback the turn on
+        settles the timer by the restore rules; later it is someone
+        switching the light on, which the restore never switches off."""
+        model, live, _, _ = self._waiting_model(
+            -60, {"light.a": "unavailable", "light.b": "off"}, sensor="unknown" if case == "unknown" else "off")
+        wait = model._restore_wait
+        live["light.a"] = "off"  # placeholder
+        self._later(model._restore_wait_event, wait, self._ev("light.a", "unavailable", "off"))
+        assert model.state == "pending" and model._restore_wait is wait
+        if case == "late":
+            wait.returned["light.a"] -= model.state_change_debounce + 1  # came back long ago
+        live["light.a"] = "on"  # the real state
+        timer = self._later(model._restore_wait_event, wait, self._ev("light.a", "off", "on"))
+        if case == "late":
+            assert model.state == "pending"
+            self._later(model._restore_wait_settled, wait)
+            assert model.state == "idle"
+            model.turn_off_control_entities.assert_not_called()
+        elif case == "off":  # ran out, every sensor reports off
+            assert model.state == "idle"
+            model.turn_off_control_entities.assert_called_once()
+        else:  # a sensor has not reported: the delay
+            assert model.state == "active_timer"
+            assert timer.call_args[0][0] == 180
+            model.turn_off_control_entities.assert_not_called()
+        assert model._restore_wait is None
+
+    def test_wait_reads_a_missing_override_without_an_error(self, caplog):
+        """An override entity not created yet reads as off, without the
+        'does not exist (yet)' ERROR at the restore and at each comeback."""
+        caplog.set_level(logging.ERROR)
+        model, live, _, _ = self._waiting_model(
+            150, {"light.a": "unavailable", "light.b": "unavailable"}, overrides=["input_boolean.missing"])
+        live["light.a"] = "on"
+        self._later(model._restore_wait_event, model._restore_wait, self._ev("light.a", "unavailable", "on"))
+        assert model.state == "active_timer"
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    def test_wait_gives_up_after_300_s_without_turn_off(self):
+        model, _, _, _ = self._waiting_model(
+            150, {"light.a": "unavailable", "light.b": "unavailable"}, sensor="off")
+        wait = model._restore_wait
+        self._later(model._restore_wait_timeout, wait, None)
+        assert model.state == "idle" and model._restore_wait is None
+        model.turn_off_control_entities.assert_not_called()
+        self._later(model._restore_wait_timeout, wait, None)  # a stale timeout does nothing
+        assert model.state == "idle"
+
+    def test_override_that_turns_on_ends_the_wait(self):
+        model, live, _, _ = self._waiting_model(
+            150, {"light.a": "unavailable", "light.b": "unavailable", "input_boolean.ov": "off"},
+            overrides=["input_boolean.ov"])
+        assert self.track.call_args[0][1] == ["light.a", "light.b", "input_boolean.ov"]
+        live["input_boolean.ov"] = "on"
+        self._later(model._restore_wait_event, model._restore_wait, self._ev("input_boolean.ov", "off", "on"))
+        assert model.state == "overridden" and model._restore_wait is None
+        model.turn_off_control_entities.assert_not_called()
+
+    def test_constrain_ends_the_wait(self):
+        model, live, _, later = self._waiting_model(150, {"light.a": "unavailable", "light.b": "unavailable"})
+        wait = model._restore_wait
+        self._later(model.constrain)
+        assert model.state == "constrained" and model._restore_wait is None
+        self.track.return_value.assert_called_once()
+        later.return_value.assert_called_once()
+        live["light.a"] = "on"
+        self._later(model._restore_wait_event, wait, self._ev("light.a", "unavailable", "on"))
+        assert model.state == "constrained"
+
+    def test_wait_does_nothing_while_ha_stops_and_is_saved_as_the_timer(self):
+        model, live, expiry, _ = self._waiting_model(150, {"light.a": "unavailable", "light.b": "unavailable"})
+        model.hass.is_stopping = True
+        live["light.a"] = "on"
+        self._later(model._restore_wait_event, model._restore_wait, self._ev("light.a", "unavailable", "on"))
+        assert model.state == "pending"
+        asyncio.run(model._async_save_state())
+        saved = model._store.async_save.call_args[0][0]
+        assert saved["state"] == "active_timer" and saved["expires_at"] == str(expiry)
+
+    def test_forced_sensor_during_the_wait_activates(self):
+        model, _, _, _ = self._waiting_model(150, {"light.a": "unavailable", "light.b": "off"})
+        self._later(model.force_activate)
+        assert model.state == "active_timer" and model._restore_wait is None
+        model.turn_on_control_entities.assert_called_once()
+
+    @pytest.mark.parametrize("saved_state", ["idle", "blocked", "active_timer"])
+    def test_restore_leaves_ec_alone_once_it_left_pending(self, saved_state):
+        """A forced sensor (or constrain) moves EC out of pending while the
+        store loads: the restore returns True and does nothing, so the caller's
+        start_monitoring() or restore_blocked() cannot raise MachineError."""
+        from datetime import timedelta
+        saved = {"state": saved_state, "saved_at": "x",
+                 "expires_at": str(datetime.now() + timedelta(seconds=150))}
+        model = self._restore_model(saved, {"light.a": "on", "light.b": "on"})
+
+        async def load():
+            model.force_activate()  # a forced sensor's on-edge during the await
+            return saved
+        model._store.async_load = load
+        result, timer, later = self._restore(model)
+        assert result is True and model.state == "active_timer"
+        model.turn_on_control_entities.assert_called_once()  # force_activate's own
+        model.turn_off_control_entities.assert_not_called()
+        later.assert_not_called()
+        self.track.assert_not_called()
+
+    def test_async_restore_expired_timer_in_stay_mode_stays_on(self):
+        model, _ = self._timer_restore_model(
+            -600, {"light.a": "on", "light.b": "on", "binary_sensor.motion": "on"})
+        model.stay = True
+        del model._start_timer
+        result, _, _ = self._restore(model)
+        assert result is True and model.state == "active_stay_on"
+        model.hass.services.async_call.assert_not_called()
+
+    @pytest.mark.parametrize("end,holder,lux", [
+        ("lights-back-off", "sensor", None), ("bound", "sensor", None), ("bound", "hold", None),
+        ("bound", "sensor", "500"),
+    ], ids=["lights-back-off-sensor", "bound-sensor", "bound-hold", "bound-sensor-bright"])
+    def test_wait_ending_in_idle_acts_on_a_sensor_that_is_on(self, end, holder, lux):
+        """A sensor edge in pending is dropped; when the wait ends in idle, a
+        regular sensor that is on activates EC as its edge would, lux-gated
+        with the same re-check. A hold sensor never switches the lights on."""
+        model, live, _, _ = self._waiting_model(
+            150, {"light.a": "unavailable", "light.b": "unavailable"}, sensor="off")
+        model.holdSensorEntities = ["binary_sensor.hold"]
+        if lux is not None:
+            model.luxEntity, model.lux_threshold = "sensor.lux", 60
+            live["sensor.lux"] = lux
+        live["binary_sensor.motion" if holder == "sensor" else "binary_sensor.hold"] = "on"
+        wait = model._restore_wait
+        if end == "bound":
+            self._later(model._restore_wait_timeout, wait, None)
+        else:
+            for e in ("light.a", "light.b"):
+                live[e] = "off"
+                self._later(model._restore_wait_event, wait, self._ev(e, "unavailable", "off"))
+            self._later(model._restore_wait_settled, wait)
+        assert model._restore_wait is None
+        model.turn_off_control_entities.assert_not_called()
+        if lux is not None:  # too bright: idle, with the re-check of a late reading armed
+            assert model.state == "idle" and model._lux_blocked
+            model.turn_on_control_entities.assert_not_called()
+            assert model._lux_recheck_handle is not None
+            assert model._lux_recheck_entity == "binary_sensor.motion"
+        elif holder == "sensor":
+            assert model.state == "active_timer"
+            model.turn_on_control_entities.assert_called_once()
+        else:
+            assert model.state == "idle"
+            model.turn_on_control_entities.assert_not_called()
 
     def test_on_enter_overridden_schedules_save(self):
         model = _build_model()
