@@ -197,7 +197,7 @@ entity_controller:
 - Changes that EC already ignores never open the window: its own context or an `ignored_event_sources` match, `grace_period`, a drop to or return from `unavailable` (a return is resynced instead), and attributes listed in `state_attributes_ignore`.
 - When only attributes changed, attributes are compared. Once the state itself changed, only the state is.
 - An entity that is `unavailable` at the end of the window is judged by the last state it reported in the window. A removed entity is skipped.
-- The check is dropped if EC left the state. It is also dropped if `grace_period` is set and that grace period is still running at the deadline, which means EC called a service in the meantime.
+- The check is dropped if EC left `active_timer`/`active_stay_on`, entered `idle`, or is in another state at the deadline. A window opened in `blocked` survives a motion onset that re-enters `blocked` (intended) and a `blocked` -> `constrained` -> `blocked` round trip inside the window (a known gap). The check is also dropped if `grace_period` is set and that grace period is still running at the deadline, which means EC called a service in the meantime.
 
 Known limits (set `0` on an instance where one of them matters):
 
@@ -205,3 +205,4 @@ Known limits (set `0` on an instance where one of them matters):
 - A second bounce that straddles the end of the window still counts as a change.
 - An entity may return from `unavailable` inside the window while the timer runs. EC's resync then turns the lights back on, and the change is usually lost.
 - A Home Assistant restart inside the window drops the pending check.
+- After a real external off, a motion onset or `entity_controller.activate` that arrives inside the window only restarts the timer; at the deadline EC goes to `idle` and the light stays off until the next sensor onset (before 9.11.3 it was re-lit at once).
