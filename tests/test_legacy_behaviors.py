@@ -191,7 +191,10 @@ class TestStateEntitiesBlocking:
                 context=MagicMock(id="ctx_state"),
             ),
         }
-        model.state_entity_state_change(ev)
+        with patch("custom_components.entity_controller.event.async_call_later") as later:
+            model.state_entity_state_change(ev)
+            model.hass.states.get = MagicMock(return_value=MagicMock(state="off", attributes={}))
+            later.call_args[0][2](None)
         # control() with is_state_entities_off → idle
         assert model.state == "idle", (
             f"Expected idle after control() (entities off), got {model.state}"
