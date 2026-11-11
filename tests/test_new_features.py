@@ -3414,6 +3414,28 @@ class TestStateChangeDebounce:
         assert model.blocked.call_count == (1 if expected == "blocked" else 0)
         model.hass.services.async_call.assert_not_called()
 
+    @pytest.mark.parametrize("debounce", [3.0, 0, None])
+    def test_idle_on_inside_grace_waits_at_least_one_second_after_it(self, debounce):
+        """The grace-deferred window ends max(state_change_debounce, 1 s)
+        after the grace period. Without the floor, a window with the debounce
+        off would fire on loop time right at the grace end, which is wall
+        clock, and its own grace check could drop the edge."""
+        from datetime import timedelta
+        model = self._idle(debounce=debounce)
+        model.grace_period = 5
+        model.ignore_state_changes_until = datetime.now() + timedelta(seconds=4)
+        floor = max(debounce or 0, 1.0)
+        with patch(self.LATER) as later, patch(self.TIMER):
+            self._idle_live(model, on=[self.E108I])
+            model.state_entity_state_change(self._event(self.E108I, "off", "on"))
+            later.assert_called_once()
+            assert 4 + floor - 0.5 < later.call_args[0][1] <= 4 + floor
+            model.ignore_state_changes_until = datetime.now() - timedelta(seconds=1)
+            self._fire(later)
+        assert model.state == "blocked"
+        model.blocked.assert_called_once()
+        model.hass.services.async_call.assert_not_called()
+
     def test_block_end_by_manual_off_then_relight_blocks(self):
         """A B-block ended by switching the light off: on_enter_idle's own
         turn_off arms the grace period, and a re-light 2 s later is judged
@@ -3632,6 +3654,23 @@ class TestStateChangeDebounce:
                  if r.levelno == logging.INFO and "block_on_external_on is false" in r.getMessage()]
         assert len(infos) == (0 if expected else 1)
         model.entity.set_attr.assert_any_call("block_on_external_on", expected)
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_block_on_external_on_attribute_survives_idle_entry(self, value):
+        """reset_state keeps the attribute on every idle entry, so the
+        opt-out stays visible on the entity."""
+        from custom_components.entity_controller import EntityController
+        entity = EntityController.__new__(EntityController)
+        entity.attributes, entity.may_update = {}, False
+        entity.async_set_context = MagicMock()
+        model = _build_model(entity=entity)
+        model.config_other({"block_on_external_on": value})
+        model.update(blocked_at=datetime.now())
+        model.constrain()
+        model.enable()  # constrained -> idle: on_enter_idle -> reset_state
+        assert model.state == "idle"
+        assert entity.attributes["block_on_external_on"] is value
+        assert "blocked_at" not in entity.attributes
 
 
 # ---------------------------------------------------------------------------
