@@ -26,11 +26,11 @@ import asyncio
 import functools
 import hashlib
 import logging
-from homeassistant.const import STATE_UNAVAILABLE
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.util import dt as dt_util
 import re
 from datetime import date, datetime, time, timedelta
-from threading import Timer
+from threading import Timer, current_thread
 import pprint
 from typing import Optional, List
 
@@ -97,6 +97,7 @@ from .const import (
     CONF_DELAY,
     CONF_BLOCK_TIMEOUT,
     CONF_DISABLE_BLOCK,
+    CONF_BLOCK_ON_EXTERNAL_ON,
     CONF_SENSOR_TYPE_DURATION,
     CONF_SENSOR_TYPE,
     CONF_SENSOR_RESETS_TIMER,
@@ -123,6 +124,8 @@ from .const import (
     CONF_LUX_THRESHOLD,
     CONF_LUX_BRIGHT_STATES,
     CONF_LUX_RECHECK_DELAY,
+    CONF_STATE_CHANGE_DEBOUNCE,
+    DEFAULT_STATE_CHANGE_DEBOUNCE,
     STORAGE_VERSION,
     STORAGE_KEY_PREFIX,
 )
@@ -140,6 +143,15 @@ _LOGGER = logging.getLogger(__name__)
 
 # Configure delay before starting to monitor state change events
 STARTUP_DELAY = 70
+
+# Longest a restored running timer waits in pending for its lights when no
+# reachable one is on (9.11.4); EC then starts in idle (in blocked for a light
+# switched on during the wait) without switching anything off.
+RESTORE_WAIT_SECONDS = 300
+
+# A hold sensor restarts the block timer at most once per this many seconds
+# (2026-11-10; the 103 radar flips about 54 times a day).
+HOLD_REARM_THROTTLE = 60
 
 devices = []
 MODE_SCHEMA = vol.Schema(
@@ -191,6 +203,8 @@ ENTITY_SCHEMA = vol.Schema(
         vol.Optional(CONF_STATE_ENTITIES, default=[]): cv.entity_ids,
         vol.Optional(CONF_BLOCK_TIMEOUT, default=None): cv.positive_int,
         vol.Optional(CONF_DISABLE_BLOCK, default=False): cv.boolean,
+        # documentation only; runtime accepts a real bool (config_other)
+        vol.Optional(CONF_BLOCK_ON_EXTERNAL_ON, default=True): cv.boolean,
         vol.Optional(CONF_IGNORE_STATE_CHANGES_UNTIL, default=None): vol.Any(None, cv.positive_int),
         vol.Optional(CONF_NIGHT_MODE, default=None): MODE_SCHEMA,
         vol.Optional(CONF_STATE_ATTRIBUTES_IGNORE, default=[]): cv.ensure_list,
@@ -205,6 +219,9 @@ ENTITY_SCHEMA = vol.Schema(
         vol.Optional(CONF_LUX_THRESHOLD, default=None): vol.Any(None, vol.Coerce(float)),
         vol.Optional(CONF_LUX_BRIGHT_STATES, default=[]): vol.All(cv.ensure_list, [cv.string]),
         vol.Optional(CONF_LUX_RECHECK_DELAY, default=1.0): vol.Any(None, vol.Coerce(float)),
+        vol.Optional(CONF_STATE_CHANGE_DEBOUNCE, default=DEFAULT_STATE_CHANGE_DEBOUNCE): vol.Any(
+            None, vol.All(vol.Coerce(float), vol.Range(min=0, max=60))
+        ),
         vol.Optional(CONF_SERVICE_DATA, default=None): vol.Coerce(
             dict
         ),
@@ -251,6 +268,12 @@ async def async_setup(hass, config):
         source="pending",
         dest="idle",
     )
+    # Restoring a saved 'blocked' or a running timer with a light on: straight
+    # from pending, since the way through idle runs on_enter_idle, which
+    # switches the lights off. restore_active_timer(resume=<seconds to run>);
+    # a restore that settles in idle uses start_monitoring(quiet=True).
+    machine.add_transition(trigger="restore_blocked", source="pending", dest="blocked")
+    machine.add_transition(trigger="restore_active_timer", source="pending", dest="active")
 
     machine.add_transition(trigger="constrain", source="*", dest="constrained")
     machine.add_transition(
@@ -458,10 +481,11 @@ async def async_setup(hass, config):
     )
 
     # Phase 3: force_activate — triggered by forced sensors.
-    # Bypasses blocked, constrained and overridden states entirely.
+    # Bypasses blocked, constrained and overridden states entirely, and ends
+    # the wait of a restored timer in pending (9.11.4).
     machine.add_transition(
         trigger="force_activate",
-        source=["idle", "blocked", "constrained", "overridden", "active_timer"],
+        source=["pending", "idle", "blocked", "constrained", "overridden", "active_timer"],
         dest="active",
     )
 
@@ -564,6 +588,7 @@ class EntityController(entity.Entity):
             "lux_entity",
             "lux_threshold",
             "lux_bright_states",
+            "block_on_external_on",
         ]
         for k, v in self.attributes.items():
             if k in PERSISTED_STATE_ATTRIBUTES:
@@ -594,6 +619,30 @@ class EntityController(entity.Entity):
         """EntityController will push its state to HA"""
         return False
 
+class _DebounceWindow:
+    """External state changes waiting for confirmation (Model._debounce_state_change)."""
+
+    __slots__ = ("state", "snapshot", "context", "handle")
+
+    def __init__(self, state):
+        self.state = state    # EC state the window was opened in
+        self.snapshot = {}    # entity_id -> [first old State or None, attribute-only so far, last State seen]
+        self.context = None   # context of the latest change; parent of EC's reaction
+        self.handle = None    # async_call_later cancel; never called
+
+
+class _RestoreWait:
+    """A restored running timer waiting in pending for its lights (Model._restore_timer)."""
+
+    __slots__ = ("expiry", "unsubs", "returned", "switched_on", "settle")
+
+    def __init__(self, expiry):
+        self.expiry = expiry     # saved run-out of the timer (naive local time)
+        self.unsubs = []         # state listener remover, async_call_later cancel
+        self.returned = {}       # light -> loop time it came back from unavailable/unknown
+        self.switched_on = set() # lights switched on during the wait, not by a comeback
+        self.settle = None       # cancel of the re-check once the lights came back off
+
 class Model:
     """ Represents the transitions state machine model """
 
@@ -617,9 +666,8 @@ class Model:
         self.triggerOnDeactivate = []
         self.triggerOnActivate = []
         self.timer_handle = None
-        self._expiry_time = None   # kdy ma dobehnout timer (pro obnovu po restartu)
-        self._pending_restore_expiry = None  # timer run-out carried over a restart
-        self._restore_retries = 0            # kolikrat jsme cekali na nedostupnou entitu
+        self._expiry_time = None   # when the running timer runs out (saved for a restart)
+        self._restore_wait = None  # _RestoreWait while a restored timer waits for its lights
         self.block_timer_handle = None
         self.sensor_type = None
         self.night_mode = None
@@ -647,6 +695,13 @@ class Model:
         self._lux_recheck_handle = None
         self._lux_recheck_entity = None
         self._lux_blocked = False
+        self.state_change_debounce = DEFAULT_STATE_CHANGE_DEBOUNCE
+        self._debounce_window = None
+        self.block_on_external_on = True
+        # set while a trigger leaves blocked (cleared in finalize); loop times
+        # of the block start / last regular-sensor entry and of the block timer
+        self._block_ending = False
+        self._block_anchor = self._block_timer_started = 0.0
         self.night_mode_entity = None
         self.night_mode_entity_states = []
         self.nightControlEntities = []
@@ -719,7 +774,10 @@ class Model:
         if wait == False:
             self.entity.do_update()
 
-    def finalize(self):
+    def finalize(self, *_args, **_kwargs):
+        # transitions passes a trigger's arguments to every callback
+        # (restore_active_timer(resume=...), start_monitoring(quiet=...)).
+        self._block_ending = False
         self.entity.do_update()
 
     # =====================================================
@@ -844,23 +902,26 @@ class Model:
             return
         try:
             if old is not None and new.state == old.state:
-                return  # jen zmena atributu
+                return  # attribute-only change
         except AttributeError:
             pass
 
         if self.matches(new.state, self.SENSOR_ON_STATE):
             # DELIBERATELY not calling sensor_on() — a hold sensor must never
             # switch the light on.
-            # Kdyz uz bezi timer, chovame se jako keep-alive.
+            # With the timer already running, act as a keep-alive; in blocked,
+            # restart the block timer in place (_hold_rearm_block).
             if self.is_active_timer():
                 self.set_context(new.context)
                 self.update(last_triggered_by=f"hold:{entity}",
                             notes="Hold sensor is on, keeping the light on")
                 self._cancel_timer()
                 self.update(expires_at="pending sensor")
+            elif self.is_blocked():
+                self._hold_rearm_block(entity)
             else:
                 self.log.debug(
-                    "hold_sensor_state_change :: %s je ON, ale nezapinam (stav %s)",
+                    "hold_sensor_state_change :: %s is ON, but not switching anything on (state %s)",
                     entity, self.state)
             return
 
@@ -879,6 +940,24 @@ class Model:
             self.update(last_triggered_by=f"hold:{entity}", sensor_turned_off_at=datetime.now(),
                         notes="Hold sensor turned off, timer started")
             self._reset_timer()
+
+    def _hold_rearm_block(self, entity):
+        """A hold sensor keeps a block alive (2026-11-10): the block timer
+        restarts in place, at most once per HOLD_REARM_THROTTLE seconds and
+        within hold_max_seconds of the block start or the last regular-sensor
+        edge; never a re-entry of blocked."""
+        if not self.block_timeout:
+            return
+        now, cap = self.hass.loop.time(), getattr(self, "hold_max_seconds", None)
+        if cap and now - self._block_anchor >= cap:
+            self.log.debug(
+                "hold_sensor_state_change :: %s is on, but no regular sensor for %s s; "
+                "the block runs out", entity, cap)
+            return
+        if now - self._block_timer_started < HOLD_REARM_THROTTLE:
+            return
+        self._start_block_timer()
+        self.update(notes="Hold sensor %s is on, block timer restarted" % entity)
 
     @callback
     def override_state_change(self, event):
@@ -977,6 +1056,10 @@ class Model:
         except AttributeError:
             came_back = False
         if came_back:
+            # A pending debounce judges this entity by what it reports now.
+            window = self._debounce_window
+            if window is not None and entity in window.snapshot:
+                window.snapshot[entity][2] = new
             is_on = self.matches(new.state, self.CONTROL_ON_STATE)
             self.log.info(
                 "state_entity_state_change :: %s came back from unavailable as '%s' (EC state: %s) — resync",
@@ -1013,44 +1096,173 @@ class Model:
             self.log.debug("state_entity_state_change :: Ignoring this state change because it came from %s" % (new.context.id))
             return
         if self.is_within_grace_period():
+            if self.is_idle() and self._external_on_edge(old, new):
+                # EC's own echo in idle is an off: judge an ON after the grace
+                # period; capped so a clock step back cannot stretch it
+                left = min(max((self.ignore_state_changes_until - datetime.now()).total_seconds(), 0),
+                           self.grace_period)
+                self._debounce_state_change(entity, old, new, False,
+                                            delay=left + max(self.state_change_debounce or 0, 1.0))
+                return
             self.log.debug("state_entity_state_change :: Ignoring this state change because we are within the grace period (until %s)", self.ignore_state_changes_until)
             return
 
 
         #  If the state changed, we definitely want to handle the transition. If only attributes changed, we'll check if the new attributes are significant (i.e., not being ignored).
+        attr_only = False
         try:
-            if not old or not new or old == 'off' or new == 'off':
-                pass
-            else:
-                if old.state == new.state:  # Only attributes changed
-                    # Build two dictionaries of attributes, excluding the ones we don't want to monitor
-                    old_temp = {
-                        key: old.attributes[key]
-                        for key in old.attributes
-                        if key not in self.state_attributes_ignore
-                    }
-                    new_temp = {
-                        key: new.attributes[key]
-                        for key in new.attributes
-                        if key not in self.state_attributes_ignore
-                    }
-                    if old_temp == new_temp:
-                        self.log.debug("state_entity_state_change :: insignificant attribute change - Ignore the state change altogether")
-                        return
-                    self.log.debug("state_entity_state_change :: A significant attribute changed and will be handled")
+            attr_only = old is not None and old.state == new.state
+            if attr_only:
+                if self._significant_attributes(old) == self._significant_attributes(new):
+                    self.log.debug("state_entity_state_change :: insignificant attribute change - Ignore the state change altogether")
+                    return
+                self.log.debug("state_entity_state_change :: A significant attribute changed and will be handled")
         except AttributeError as a:
-            # Most likely one of the states, either new or old, is 'off', so there's no attributes dict attached to the state object.
-            self.log.debug(
-                "state_entity_state_change :: Most likely one of the states, either new or old, is 'off', so there's no attributes dict attached to the state object: "
-                + str(a)
-            )
+            attr_only = False
+            self.log.debug("state_entity_state_change :: cannot compare the two states, handling the change: %s", a)
+        if self._debounce_state_change(entity, old, new, attr_only):
+            return
         self.set_context(new.context)
+        if self.is_idle():
+            # acts only with the debounce off; with it on, an ON edge went into the window
+            if self._external_on_edge(old, new):
+                self._block_external_on([entity])
+            return
         if self.is_active_timer():
             self.log.debug("state_entity_state_change :: We are in active timer and the state of observed state entities changed.")
             self.control()
 
         if self.is_blocked() or self.is_active_stay_on(): # if statement required to avoid MachineErrors, cleaner than adding transitions to all possible states.
             self.enable()
+
+    def _significant_attributes(self, state):
+        return {
+            key: value for key, value in state.attributes.items()
+            if key not in self.state_attributes_ignore
+        }
+
+    def _debounce_state_change(self, entity, old, new, attr_only, delay=None):
+        """Hold an external change for state_change_debounce seconds.
+
+        Returns False when the change is handled at once (debounce off, or a
+        state without a reaction). The deadline runs from the first change and
+        is not extended; _state_debounce_fire acts once if anything persisted.
+        In idle only an ON edge opens a window. delay: an ON edge in idle
+        inside the grace period, judged after it.
+        """
+        if delay is None:
+            if not self.state_change_debounce or self.state not in (
+                "active_timer", "blocked", "active_stay_on", "idle"
+            ):
+                return False
+            delay = self.state_change_debounce
+        window = self._debounce_window
+        if window is None or window.state != self.state:
+            if self.state == "idle" and not self._external_on_edge(old, new):
+                return False
+            window = _DebounceWindow(self.state)
+            self._debounce_window = window
+            window.handle = event.async_call_later(
+                self.hass, delay,
+                functools.partial(self._state_debounce_fire, window),
+            )
+            self.log.debug(
+                "state_entity_state_change :: %s changed in %s; acting only if it persists for %.1f s",
+                entity, self.state, delay)
+        else:
+            self.log.debug("state_entity_state_change :: %s changed; check already pending", entity)
+        entry = window.snapshot.setdefault(entity, [old, attr_only, new])
+        entry[1] = entry[1] and attr_only
+        entry[2] = new
+        window.context = new.context
+        return True
+
+    @callback
+    def _state_debounce_fire(self, window, _now=None):
+        """Act once on the changes in window if any of them persisted."""
+        if self._debounce_window is not window:
+            return
+        self._debounce_window = None
+        if self.state != window.state:
+            self.log.debug("_state_debounce_fire :: EC left %s, dropping the change of %s", window.state, ", ".join(window.snapshot))
+            return
+        if self.is_within_grace_period():
+            self.log.info("_state_debounce_fire :: dropping the change of %s: EC called a service meanwhile (grace period)", ", ".join(window.snapshot))
+            return
+        result = {e: self._debounce_persisted(e, *entry) for e, entry in window.snapshot.items()}
+        gone = [e for e, r in result.items() if r is None]
+        back = [e for e, r in result.items() if r is not None and not r]
+        changed = [e for e, r in result.items() if r]
+        # in idle only a take-over logs at INFO
+        log = self.log.debug if window.state == "idle" else self.log.info
+        if gone:
+            log("_state_debounce_fire :: %s is gone - not compared", ", ".join(gone))
+        if not changed:
+            if back:
+                log("_state_debounce_fire :: %s is back to its previous state - ignoring the bounce (EC state: %s)", ", ".join(back), self.state)
+            return
+        if window.state != "idle":
+            self.log.info("_state_debounce_fire :: %s changed for good - handling it (EC state: %s)", ", ".join(changed), self.state)
+        self.set_context(window.context)
+        if self.state != window.state:
+            self.log.debug("_state_debounce_fire :: EC left %s meanwhile, not acting", window.state)
+        elif window.state == "active_timer":
+            self.control()
+        elif window.state == "idle":
+            self._block_external_on([e for e in changed if self._external_on_edge(
+                window.snapshot[e][0], self._debounce_current(e, window.snapshot[e][2]))])
+        else:
+            self.enable()
+
+    def _debounce_persisted(self, entity, old, attr_only, last):
+        """True if entity still differs from its state before the window,
+        False if it is back, None if it is gone (not compared).
+
+        An unavailable entity is judged by the last state it reported in the
+        window: a real off followed by a link drop still counts.
+        """
+        cur = self._debounce_current(entity, last)
+        if cur is None:
+            return None
+        old_state = getattr(old, "state", None)
+        if old_state is None or cur.state != old_state:
+            return True
+        return attr_only and self._significant_attributes(cur) != self._significant_attributes(old)
+
+    def _debounce_current(self, entity, last):
+        """The entity's state now; while unavailable, the last state it reported."""
+        cur = self.hass.states.get(entity)
+        if cur is not None and cur.state == STATE_UNAVAILABLE:
+            cur = last
+        return cur
+
+    def _external_on_blocks(self):
+        """A light switched on outside EC while idle puts EC in blocked."""
+        return self.block_on_external_on is True and self.is_block_enabled()
+
+    def _external_on_edge(self, old, new):
+        """An ON edge that counts for _external_on_blocks: off, unknown or
+        nothing before, on now. A return from unavailable is the resync's."""
+        if not self._external_on_blocks():
+            return False
+        new_state, old_state = getattr(new, "state", None), getattr(old, "state", None)
+        if new_state is None or not self.matches(new_state, self.STATE_ON_STATE):
+            return False
+        return old_state is None or old_state == STATE_UNKNOWN or self.matches(old_state, self.STATE_OFF_STATE)
+
+    def _is_control_on(self, entity):
+        s = self.hass.states.get(entity)
+        return s is not None and self.matches(s.state, self.CONTROL_ON_STATE)
+
+    def _block_external_on(self, lit):
+        """idle -> blocked for lights switched on outside EC; no service call."""
+        if not lit or not self.is_state_entities_on():
+            self.log.debug("_block_external_on :: nothing switched on for good; staying idle")
+            return
+        self.log.info("%s switched on outside EC while idle; blocked (block_timeout %s)",
+                      ", ".join(lit), self.block_timeout)
+        self.blocked()
+        self.update(last_triggered_by=lit[0], notes="Switched on outside EC while idle")
 
     @callback
     def forced_sensor_state_change(self, ev):
@@ -1101,7 +1313,9 @@ class Model:
         if self.is_idle() or self.is_active_timer() or self.is_blocked():
             self.sensor_on()
 
-    def _start_timer(self):
+    def _start_timer(self, delay=None):
+        """delay: run this many seconds instead of the configured delay
+        (a timer resumed after a restart)."""
         self.log.info("_start_timer :: Light params: " + str(self.lightParams))
         if self.backoff_count == 0:
             self.previous_delay = self.lightParams.get(CONF_DELAY, DEFAULT_DELAY)
@@ -1118,12 +1332,14 @@ class Model:
                 self.log.debug("Max backoff reached. Will not increase further.")
                 self.previous_delay = self.backoff_max
             self.update(delay=self.previous_delay)
+        if delay is None:
+            delay = self.previous_delay
 
-        expiry_time = datetime.now() + timedelta(seconds=self.previous_delay)
+        expiry_time = datetime.now() + timedelta(seconds=delay)
 
         # not able to use async_call_later because no known way to check whether timer is active.
         # self.timer_handle = event.async_call_later(self.hass, self.previous_delay, self.timer_expire)
-        self.timer_handle = Timer(self.previous_delay, self.timer_expire)
+        self.timer_handle = Timer(delay, self.timer_expire)
         self.timer_handle.start()
         self._expiry_time = expiry_time
         self.update(expires_at=expiry_time)
@@ -1152,6 +1368,13 @@ class Model:
             self.timer_expires()
 
     def block_timer_expire(self):
+        # A timer replaced by a restart, or one firing outside blocked, is
+        # stale (block_timer_expires from idle raises MachineError).
+        t = current_thread()
+        if (getattr(t, "function", None) == self.block_timer_expire and t is not self.block_timer_handle) \
+                or not self.is_blocked():
+            self.log.debug("block_timer_expire :: stale block timer (EC state %s), ignoring", self.state)
+            return
         self.log.debug("block_timer_expire :: Blocked Timer expired")
         self.block_timer_expires()
 
@@ -1420,11 +1643,21 @@ class Model:
     # =====================================================
     # S T A T E   M A C H I N E   C A L L B A C K S
     # =====================================================
-    def on_enter_idle(self):
+    def on_exit_pending(self, *_args, **_kwargs):
+        # Every way out of pending (restore, override, constrain, a forced
+        # sensor) ends a restored timer's wait. Takes the trigger's arguments
+        # like every callback (restore_active_timer(resume=...)).
+        self._restore_wait_end()
+
+    def on_enter_idle(self, quiet=False):
+        """quiet: a restore settles in idle without the on_enter_idle
+        behaviour (start_monitoring(quiet=True))."""
         self.log.debug("Entering idle")
+        self._debounce_window = None
         # Entering idle due to no events, set a new context with no parent
         self.set_context(None)
-        self.do_transition_behaviour(CONF_ON_ENTER_IDLE)
+        if not quiet:
+            self.do_transition_behaviour(CONF_ON_ENTER_IDLE)
         self.entity.reset_state()
 
     def on_exit_idle(self):
@@ -1441,16 +1674,19 @@ class Model:
         self.do_transition_behaviour(CONF_ON_EXIT_OVERRIDDEN)
         self._schedule_save_state()
 
-    def on_enter_active(self):
+    def on_enter_active(self, resume=None):
+        """resume: seconds to run for a timer restored after a restart
+        (restore_active_timer); the lights are then left as they are."""
         self.log.debug("Entering active")
         self.update(last_triggered_at=str(datetime.now()))
         self.backoff_count = 0
         self.prepare_service_data()
 
-        self._start_timer()
+        self._start_timer(resume)
 
         self.log.debug("on_enter_active :: light params before turning on: " + str(self.lightParams))
-        self.do_transition_behaviour(CONF_ON_ENTER_ACTIVE)
+        if resume is None:
+            self.do_transition_behaviour(CONF_ON_ENTER_ACTIVE)
         self.enter()
 
     def on_exit_active(self):
@@ -1462,23 +1698,46 @@ class Model:
         )  # no need to update immediately
         self.do_transition_behaviour(CONF_ON_EXIT_ACTIVE)
 
+    # May run off the loop (threading.Timer worker, service executor): a single
+    # store, the loop-side fire then finds its window gone. No such hook for
+    # blocked: a sensor edge re-enters blocked and must not drop a pending check.
+    def on_exit_active_timer(self):
+        self._debounce_window = None
+
+    def on_exit_active_stay_on(self):
+        self._debounce_window = None
+
     def on_enter_blocked(self):
         self.log.debug("Entering blocked")
         self.update(blocked_at=datetime.now())
         self.update(blocked_by=self._state_entity_state())
 
         self.do_transition_behaviour(CONF_ON_ENTER_BLOCKED)
+        self._block_anchor = self.hass.loop.time()
         if self.block_timeout:
-            self.block_timer_handle = Timer(self.block_timeout, self.block_timer_expire)
-            self.block_timer_handle.start()
-            self.update(block_timeout=self.block_timeout)
+            self._start_block_timer()
         self._schedule_save_state()
+
+    def _start_block_timer(self):
+        # Locals only: the expiring timer's worker may clear the handle
+        # (on_exit_blocked) at any point in between.
+        old, new = self.block_timer_handle, Timer(self.block_timeout, self.block_timer_expire)
+        if old is not None:
+            old.cancel()
+        self.block_timer_handle = new
+        self._block_timer_started = self.hass.loop.time()
+        new.start()
+        self.update(block_timeout=self.block_timeout,
+                    expires_at=datetime.now() + timedelta(seconds=self.block_timeout))
 
     def on_exit_blocked(self):
         self.log.debug("Exiting blocked")
         self.do_transition_behaviour(CONF_ON_EXIT_BLOCKED)
-        if self.block_timer_handle and self.block_timer_handle.is_alive():
-            self.block_timer_handle.cancel()
+        handle = self.block_timer_handle
+        if handle:
+            handle.cancel()
+        self.block_timer_handle = None
+        self._block_ending = True
         self._schedule_save_state()
 
     def on_enter_constrained(self):
@@ -1880,7 +2139,28 @@ class Model:
 
         self.block_timeout = config.get(CONF_BLOCK_TIMEOUT, None)
         self.grace_period = config.get(CONF_IGNORE_STATE_CHANGES_UNTIL, None)
+        raw = config.get(CONF_STATE_CHANGE_DEBOUNCE, DEFAULT_STATE_CHANGE_DEBOUNCE)
+        try:
+            if isinstance(raw, bool):
+                raise ValueError(raw)
+            debounce = 0.0 if raw is None else float(raw)
+            if not 0 <= debounce <= 60:
+                raise ValueError(raw)
+        except (TypeError, ValueError, OverflowError):
+            self.log.error(
+                "state_change_debounce must be 0-60 seconds or null, got %r; using %s",
+                raw, DEFAULT_STATE_CHANGE_DEBOUNCE)
+            debounce = DEFAULT_STATE_CHANGE_DEBOUNCE
+        self.state_change_debounce = debounce or None
         self.disable_block = config.get(CONF_DISABLE_BLOCK, False)
+        external_on = config.get(CONF_BLOCK_ON_EXTERNAL_ON, True)
+        if not isinstance(external_on, bool):
+            self.log.error("block_on_external_on must be true or false, got %r; using true", external_on)
+            external_on = True
+        self.block_on_external_on = external_on
+        self.update(block_on_external_on=external_on)
+        if not external_on:
+            self.log.info("block_on_external_on is false: a light switched on outside EC while idle is left as it is")
         self.image_prefix = config.get("image_prefix", "/fsm_diagram_")
         self.image_path = config.get("image_path", "/conf/temp")
         self.backoff = config.get("backoff", False)
@@ -1928,15 +2208,21 @@ class Model:
         """Persist the current EC state to HA storage."""
         if self._store is None:
             return
+        state, expiry = self.state, self._expiry_time
+        wait = getattr(self, "_restore_wait", None)
+        if wait is not None:
+            # Still waiting for the lights of a restored timer: keep that
+            # timer for the next start instead of saving 'pending'.
+            state, expiry = "active_timer", wait.expiry
         data = {
-            "state": self.state,
+            "state": state,
             "saved_at": str(datetime.now()),
             # The timer expiry time is needed so the run-out can be finished
             # after a restart — otherwise EC ends up in 'idle' and nothing ever
             # turns the controlled light off (measured 2026-08-19: out of 24
             # restarts the light stayed on 21 times, with a 20-40 min tail
             # after the last motion).
-            "expires_at": str(self._expiry_time) if self._expiry_time else None,
+            "expires_at": str(expiry) if expiry else None,
         }
         self.log.debug("_async_save_state :: Saving state: %s", data)
         await self._store.async_save(data)
@@ -1944,8 +2230,9 @@ class Model:
     async def _async_restore_state(self):
         """Load persisted state from HA storage and restore if applicable.
 
-        Returns True when the state was successfully restored so the caller
-        can skip the normal startup evaluation.
+        Returns True when the state was successfully restored, or when EC
+        already left pending while the store loaded (nothing to restore), so
+        the caller can skip the normal startup evaluation.
         """
         if self._store is None:
             return False
@@ -1953,7 +2240,13 @@ class Model:
             data = await self._store.async_load()
         except (OSError, ValueError) as exc:
             self.log.warning("_async_restore_state :: Failed to load persisted state: %s", exc)
-            return False
+            data = None
+        if getattr(self, "state", "pending") != "pending":
+            # EC left pending while the store loaded (constrain 1 s after
+            # the config, a forced sensor): leave it there; the caller's
+            # start_monitoring() would raise MachineError. getattr: test
+            # models built with Model.__new__ have no state.
+            return True
 
         if not data:
             self.log.debug("_async_restore_state :: No persisted state found")
@@ -1977,9 +2270,14 @@ class Model:
         if saved_state == "blocked":
             # Only restore blocked if the state entity is still on (otherwise the
             # entity was turned off while HA was down — go to idle instead).
+            # Straight from pending (2026-10-31): the old way through idle ran
+            # on_enter_idle, which switched every light off and left EC blocked
+            # in the dark. set_context() replaces the one on_enter_idle set.
+            if len(self.overrideEntities) > 0 and self.is_override_state_on():
+                return False  # the caller enters overridden, as on a normal start
             if self.is_state_entities_on() and self.is_block_enabled():
-                self.start_monitoring()
-                self.sensor_on()  # triggers idle→active→blocked via normal transitions
+                self.set_context(None)
+                self.restore_blocked()
                 return True
             return False
 
@@ -1993,124 +2291,294 @@ class Model:
             expiry = self._parse_saved_expiry(data.get("expires_at"))
             if expiry is None:
                 return False
-            if self._state_entities_unavailable():
-                # The controlled entity has not come up yet — bulbs behind a
-                # relay report later than EC starts (STARTUP_DELAY = 70 s).
-                # This is EXACTLY the case where even the on_enter_idle command
-                # is lost and the light then hangs on, so we must not give up:
-                # defer the decision to _restore_timer_finish, which waits for
-                # the entity.
-                self._pending_restore_expiry = expiry
-                self.log.info(
-                    "_async_restore_state :: Controlled entity is not available yet, "
-                    "deferring the run-out decision (expiry %s)", expiry)
-                event.async_call_later(self.hass, 30, self._restore_timer_finish)
-                return False
-            if not self.is_state_entities_on():
-                # The light was turned off meanwhile (manually or by another
-                # automation) — there is nothing to finish.
-                return False
-            remaining = (expiry - datetime.now()).total_seconds()
-            if remaining <= 1:
-                # NOTE: start_monitoring() may only be called here, where we
-                # return True. The other branch returns False and the caller
-                # invokes it itself — otherwise it would register twice.
-                self.start_monitoring()
-                # The timer would have expired while HA was down -> finish the
-                # turn-off.
-                self.log.info(
-                    "_async_restore_state :: Timer expired while HA was down (%s), turning control entities off",
-                    expiry)
-                self.turn_off_control_entities()
-                self.update(notes="Timer expired while HA was down — entities turned off")
-                return True
-            # The timer has not run out yet. We do not try to re-arm it via
-            # sensor_on() — on an already-on entity that deliberately leads to
-            # 'blocked' (the same path the blocked-restore above uses). Instead
-            # EC keeps running normally and we only finish what the timer did
-            # not: turn off after the remaining time, unless EC has taken over
-            # control meanwhile.
-            self._pending_restore_expiry = expiry
-            self.log.info(
-                "_async_restore_state :: Timer from before restart has %.0f s left, scheduling turn-off",
-                remaining)
-            self.update(notes="Timer from before restart: %.0f s left" % remaining)
-            event.async_call_later(self.hass, remaining, self._restore_timer_finish)
-            return False
+            return self._restore_timer(expiry)
 
         # For all other states (idle, constrained, etc.) let the normal startup
         # evaluation run.
         return False
 
-    @callback
-    def _restore_timer_finish(self, _now=None):
-        """Finish the turn-off that the timer running before the restart owed.
+    def _restore_timer(self, expiry, settled=False):
+        """Settle a saved active_timer from the live states (EC in pending).
 
-        Deliberately outside the state machine: when the controlled light is on
-        at startup, EC ends up in 'blocked' (external control) or 'idle' and
-        never turns it off by itself. If motion arrived meanwhile and EC took
-        over control (active_timer / overridden), we do not interfere.
+        Runs at the restore and again on each comeback while the restore
+        waits for its lights. Returns False only at the restore, when the
+        caller starts as usual (an override is on, or every light is off).
+        EC is in pending: the restore checks it after the store load, and a
+        wait ends on every exit from pending (on_exit_pending).
+        settled: the lights stayed off for state_change_debounce after
+        coming back (_restore_wait_settled).
         """
-        expiry = self._pending_restore_expiry
-        if expiry is None:
-            return
-        if self.is_active_timer() or self.is_overridden():
-            self._pending_restore_expiry = None
-            self.log.debug("_restore_timer_finish :: EC has already taken over control, not interfering")
-            return
-        # The key case: during EC initialisation (STARTUP_DELAY) bulbs behind a
-        # relay are often still 'unavailable', because localtuya/Tasmota come up
-        # later. EC does enter idle and send turn_off at that point, but the
-        # command goes nowhere; when the light then shows up on, EC treats it as
-        # external control and ends in 'blocked' -> it never turns off again.
-        # That is why we wait for an unavailable entity here instead of giving up.
-        if self._state_entities_unavailable():
-            if self._restore_retries < 10:
-                self._restore_retries += 1
-                self.log.debug(
-                    "_restore_timer_finish :: Controlled entity is unavailable, retrying in 30 s (%d/10)",
-                    self._restore_retries)
-                event.async_call_later(self.hass, 30, self._restore_timer_finish)
-            else:
-                self._pending_restore_expiry = None
-                self.log.warning(
-                    "_restore_timer_finish :: Controlled entity stayed unavailable, giving up on the run-out")
-            return
-        if not self.is_state_entities_on():
-            self._pending_restore_expiry = None
-            self.log.debug("_restore_timer_finish :: The light is no longer on, doing nothing")
-            return
-        # The entity is available and on. If the timer has not run out yet
-        # (typically when we got here from the deferred decision after 30 s),
-        # wait exactly the remaining time — otherwise we would turn off earlier
-        # than the timer was due to expire.
-        remaining = (expiry - datetime.now()).total_seconds()
-        if remaining > 1:
-            self.log.debug(
-                "_restore_timer_finish :: Entity is back, timer has %.0f s left", remaining)
-            event.async_call_later(self.hass, remaining, self._restore_timer_finish)
-            return
-        self._pending_restore_expiry = None
-        self.log.info("_restore_timer_finish :: Turning control entities off (timer from before restart)")
-        self.turn_off_control_entities()
-        self.update(notes="Turned off by timer carried over the restart")
-
-    def _state_entities_unavailable(self):
-        """True when at least one controlled/state entity is not available yet."""
-        for e in self.stateEntities:
-            st = self.hass.states.get(e)
-            if st is None or st.state in ("unavailable", "unknown"):
+        waiting = self._restore_wait is not None
+        override = self._restore_override_on()
+        if override is not None:
+            if not waiting:
+                return False  # the caller enters overridden, as on a normal start
+            self.set_context(None)
+            self.update(overridden_by=override)
+            self.override()
+            self.update(overridden_at=str(datetime.now()),
+                        notes="Override turned on while waiting for the lights after the restart")
+            return True
+        lit, unreachable = self._restore_light_states()
+        if not lit:
+            if unreachable:
+                # No reachable light is on: a turn-off would go nowhere and a
+                # resume would let the comeback resync light a dark room, so
+                # wait for the others.
+                if not waiting:
+                    self._restore_wait_start(expiry, unreachable)
                 return True
-        return False
+            if not waiting:
+                return False  # every light is off: nothing to finish
+            if self.state_change_debounce and not settled:
+                # Tasmota lights come back 'off' and report their real state
+                # 1-2 s later: end the wait only once every light has stayed
+                # off that long (_restore_wait_event keeps listening).
+                self._restore_settle(self._restore_wait)
+                return True
+            self.log.info("_restore_timer :: the lights came back off; idle without turning anything off")
+            self._restore_idle("Lights came back off after the restart; idle without turning anything off")
+            return True
+        switched_on = sorted(self._restore_wait.switched_on.intersection(lit)) if waiting else []
+        if switched_on:
+            if self._restore_block_switched_on(switched_on):
+                return True
+            # Someone switched a light on during the wait: external control,
+            # as at runtime; the restore never switches such a light off.
+            self.log.info("_restore_timer :: %s switched on during the wait; idle without turning anything off",
+                          ", ".join(switched_on))
+            self._restore_idle("%s switched on during the wait after the restart; idle without turning "
+                               "anything off" % ", ".join(switched_on))
+            return True
+        self.prepare_service_data()  # day/night delay and targets as of now
+        sensor_on, sensor_unknown = self._restore_sensor_knowledge()
+        delay, cap = self._restore_delays()
+        remaining = (expiry - datetime.now()).total_seconds()
+        if remaining <= 1 and not (sensor_on or sensor_unknown):
+            # Ran out while HA was down and every sensor reports off: one
+            # turn-off, whatever on_enter_idle says.
+            self.log.info(
+                "_restore_timer :: timer ran out while HA was down (%s) and no sensor "
+                "holds the light, turning control entities off", expiry)
+            self.start_monitoring(quiet=True)
+            self.turn_off_control_entities()
+            self.update(notes="Timer ran out while HA was down and no sensor holds the light — entities turned off")
+            return True
+        if remaining <= 1:
+            # A sensor holds the light, or has not reported yet (Zigbee2MQTT
+            # sensors stay 'unknown' for 15 s to minutes after a start): run
+            # the configured delay, as after the sensor's off edge.
+            resume, reason = delay, "ran out while HA was down; a sensor holds the light or has not reported yet"
+        elif sensor_unknown and remaining < delay:
+            resume, reason = delay, "a sensor has not reported yet; the delay instead of %.0f s left" % remaining
+        elif remaining > cap:
+            resume, reason = cap, "capped from %.0f s left" % remaining
+        else:
+            resume, reason = remaining, "time left"
+        self.log.info("_restore_timer :: resuming the timer from before the restart for %.1f s (%s)", resume, reason)
+        self.set_context(None)
+        self.restore_active_timer(resume=resume)
+        self.update(notes="Timer from before restart: %.0f s (%s)" % (resume, reason))
+        return True
+
+    def _restore_light_states(self):
+        """(reachable state entities that are on, state entities not reachable yet).
+
+        Not reachable: unavailable, unknown or not created yet.
+        """
+        lit, unreachable = [], []
+        for e in self.stateEntities:
+            s = self.hass.states.get(e)
+            if s is None or s.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                unreachable.append(e)
+            elif self.matches(s.state, self.STATE_ON_STATE):
+                lit.append(e)
+        return lit, unreachable
+
+    def _restore_override_on(self):
+        """The override entity that is on, or None. One not created yet reads
+        as off, without the "does not exist (yet)" ERROR of
+        _override_entity_state at the restore and at every wait event."""
+        for e in self.overrideEntities:
+            s = self.hass.states.get(e)
+            if s is not None and self.matches(s.state, self.OVERRIDE_ON_STATE):
+                return e
+        return None
+
+    def _restore_sensor_knowledge(self):
+        """(a sensor or hold sensor holds the light, one has not reported yet).
+
+        Not reported: unknown, unavailable or not created yet. Forced and
+        HA-event sensors have no state to wait for. Same reading as
+        _sensor_entity_state (a stuck hold sensor does not hold), without
+        its "does not exist (yet)" ERROR for a sensor not created yet.
+        """
+        regular = list(self.sensorEntities)
+        holds = list(getattr(self, "holdSensorEntities", []))
+        on = unknown = False
+        for e in regular + holds:
+            s = self.hass.states.get(e)
+            if s is None or s.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                unknown = True
+            elif self.matches(s.state, self.SENSOR_ON_STATE) and not (
+                    e in holds and e not in regular and self._hold_sensor_is_stuck(e, s)):
+                on = True
+        return on, unknown
+
+    def _restore_delays(self):
+        """(delay of the current mode, cap) in seconds for a restored timer.
+
+        cap is the longest timer this instance can run: the day delay, the
+        night delay with night_mode set, backoff_max with backoff on. The
+        saved run-out is naive local time, so a DST fall-back or a clock
+        step could otherwise resume up to an hour. A value that is not a
+        number is left out.
+        """
+        def seconds(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        candidates = [seconds(self.light_params_day.get(CONF_DELAY, DEFAULT_DELAY))]
+        if self.night_mode is not None:
+            candidates.append(seconds(self.light_params_night.get(CONF_DELAY, DEFAULT_DELAY)))
+        if self.backoff:
+            candidates.append(seconds(getattr(self, "backoff_max", None)))
+        cap = max((c for c in candidates if c is not None), default=float(DEFAULT_DELAY))
+        delay = seconds(self.lightParams.get(CONF_DELAY, DEFAULT_DELAY))
+        return (cap if delay is None else min(delay, cap)), cap
+
+    def _restore_wait_start(self, expiry, unreachable):
+        """Wait in pending for the lights of a restored timer."""
+        wait = _RestoreWait(expiry)
+        self._restore_wait = wait
+        wait.unsubs.append(event.async_track_state_change_event(
+            self.hass, list(self.stateEntities) + list(self.overrideEntities),
+            functools.partial(self._restore_wait_event, wait)))
+        wait.unsubs.append(event.async_call_later(
+            self.hass, RESTORE_WAIT_SECONDS,
+            functools.partial(self._restore_wait_timeout, wait)))
+        self.log.info(
+            "_restore_timer :: %s not reachable yet and no reachable light is on; waiting "
+            "up to %d s (timer from before restart, expiry %s)",
+            ", ".join(unreachable), RESTORE_WAIT_SECONDS, expiry)
+        self.update(notes="Waiting up to %d s for %s to report (timer from before restart)"
+                    % (RESTORE_WAIT_SECONDS, ", ".join(unreachable)))
+
+    @callback
+    def _restore_wait_event(self, wait, ev):
+        """A light or override entity changed while a restored timer waits."""
+        if self._restore_wait is not wait or self.hass.is_stopping:
+            return
+        entity = ev.data["entity_id"]
+        old, new = ev.data["old_state"], ev.data["new_state"]
+        if entity not in self.overrideEntities:
+            # A comeback counts (from unavailable, unknown or not created yet
+            # to a real state), and so does the light turning on within
+            # state_change_debounce of its comeback: its real state after a
+            # placeholder 'off'. Any other turn on is someone switching it on.
+            # The runtime resync is unchanged.
+            not_yet = (STATE_UNAVAILABLE, STATE_UNKNOWN)
+            if new is None or new.state in not_yet:
+                return
+            now = self.hass.loop.time()
+            if old is None or old.state in not_yet:
+                wait.returned[entity] = now
+            elif new.state == old.state or not self.matches(new.state, self.STATE_ON_STATE):
+                return
+            elif entity not in wait.returned or now - wait.returned[entity] > (self.state_change_debounce or 0):
+                wait.switched_on.add(entity)
+                return
+        self.log.info("_restore_wait_event :: %s is now '%s', settling the timer from before restart",
+                      entity, getattr(new, "state", None))
+        self._restore_timer(wait.expiry)
+
+    @callback
+    def _restore_wait_timeout(self, wait, _now=None):
+        """The lights of a restored timer did not report in time."""
+        if self._restore_wait is not wait or self.hass.is_stopping or not self.is_pending():
+            return
+        self.log.warning(
+            "_restore_wait_timeout :: lights still not reachable after %d s; ending the wait "
+            "without a turn-off", RESTORE_WAIT_SECONDS)
+        lit, _ = self._restore_light_states()
+        if self._restore_block_switched_on(sorted(wait.switched_on.intersection(lit))):
+            return
+        self._restore_idle("Lights did not report within %d s after the restart; idle without "
+                           "turning anything off" % RESTORE_WAIT_SECONDS)
+
+    def _restore_settle(self, wait):
+        """(Re)arm the re-check that ends the wait once the lights stayed off."""
+        if wait.settle is not None:
+            wait.settle()
+        wait.settle = event.async_call_later(
+            self.hass, self.state_change_debounce, functools.partial(self._restore_wait_settled, wait))
+        self.log.info("_restore_timer :: the lights came back off; idle unless one turns on within %s s",
+                      self.state_change_debounce)
+
+    @callback
+    def _restore_wait_settled(self, wait, _now=None):
+        """The lights stayed off for state_change_debounce after coming back."""
+        if self._restore_wait is not wait or self.hass.is_stopping or not self.is_pending():
+            return
+        wait.settle = None
+        self._restore_timer(wait.expiry, settled=True)
+
+    def _restore_block_switched_on(self, lights):
+        """Lights switched on during the wait end it in blocked, as at
+        runtime in idle (2026-11-10); False when that does not apply."""
+        if not lights or not self._external_on_blocks():
+            return False
+        names = ", ".join(lights)
+        self.log.info("_restore_timer :: %s switched on during the wait; blocked", names)
+        self.set_context(None)
+        self.restore_blocked()
+        self.update(last_triggered_by=lights[0],
+                    notes="%s switched on during the wait after the restart; blocked" % names)
+        return True
+
+    def _restore_idle(self, notes):
+        """End a restored timer's wait in idle without a turn-off.
+
+        A sensor edge in pending was dropped (sensor_state_change acts only
+        in idle/active_timer/blocked), so a regular sensor that is on now
+        gets the sensor_on() its edge would have made: lux-gated
+        idle -> active, or blocked when a light was switched on by hand.
+        Hold sensors never switch the lights on.
+        """
+        self.start_monitoring(quiet=True)
+        self.update(notes=notes)
+        for e in self.sensorEntities:
+            s = self.hass.states.get(e)
+            if s is not None and self.matches(s.state, self.SENSOR_ON_STATE):
+                self.log.info("_restore_idle :: %s is on, acting on it as on its edge", e)
+                self.update(last_triggered_by=e, notes=notes + "; %s is on, activating" % e)
+                self.sensor_on()
+                if self.is_idle() and getattr(self, "_lux_blocked", False):
+                    self._schedule_lux_recheck(e)
+                break
+
+    def _restore_wait_end(self):
+        """Drop a restored timer's wait. Every exit from pending runs on the loop."""
+        wait = getattr(self, "_restore_wait", None)
+        if wait is None:
+            return
+        self._restore_wait = None
+        for unsub in wait.unsubs + ([wait.settle] if wait.settle else []):
+            unsub()
+        # Overwritten by the restore's own outcome; stays when an override,
+        # constrain or a forced sensor ended the wait.
+        self.update(notes="Restore wait ended before the lights reported")
 
     def _parse_saved_expiry(self, raw):
-        """Prevede ulozeny cas vyprseni na datetime (naivni lokalni cas)."""
+        """Parse the saved expiry time into a datetime (naive local time)."""
         if not raw or raw == "None":
             return None
         try:
             return datetime.fromisoformat(str(raw))
         except ValueError:
-            self.log.warning("_parse_saved_expiry :: Nelze precist ulozeny expires_at: %s", raw)
+            self.log.warning("_parse_saved_expiry :: Cannot read the saved expires_at: %s", raw)
             return None
 
     @callback
@@ -2278,7 +2746,12 @@ class Model:
 
     def turn_off_control_entities(self):
         self.handleTriggerOnDeactivateEntities()
-        for e in self.activeControlEntities or self.controlEntities:
+        targets = list(self.activeControlEntities or self.controlEntities)
+        if getattr(self, "_block_ending", False) and self.is_idle():
+            # 2026-11-10: a block ending in idle also switches off a lit target of the other mode
+            targets += [e for e in dict.fromkeys(self.controlEntities + self.nightControlEntities)
+                        if e not in targets and self._is_control_on(e)]
+        for e in targets:
             self.log.debug("turn_off_control_entities :: Turning off %s", e)
 
             if self.lightParams.get(CONF_SERVICE_DATA_OFF) is not None:
