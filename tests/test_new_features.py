@@ -280,6 +280,9 @@ def _build_model(hass=None, entity=None, config=None):
         m.activeControlEntities = []
         m._state_entities_explicit = False
         m.disable_block = False
+        m.block_on_external_on = True
+        m._block_ending = False
+        m._block_anchor = m._block_timer_started = 0.0
         m.block_timeout = None
         m.grace_period = None
         m.ignore_state_changes_until = datetime.now()
@@ -1181,34 +1184,48 @@ class TestStatePersistence:
         assert model.state == "pending" and model._restore_wait is wait
         model.turn_off_control_entities.assert_not_called()
 
-    @pytest.mark.parametrize("then,sensor", [("comeback", "off"), ("override-attribute", "off"), ("comeback", "on")],
-                             ids=["comeback", "override-attribute", "comeback-sensor-on"])
-    def test_wait_never_switches_off_a_light_switched_on_during_it(self, then, sensor):
+    @pytest.mark.parametrize("then,sensor,optout", [
+        ("comeback", "off", None), ("override-attribute", "off", None), ("comeback", "on", None),
+        ("comeback", "off", "block_on_external_on"), ("comeback", "off", "disable_block"),
+    ], ids=["comeback", "override-attribute", "comeback-sensor-on", "opt-out", "disable-block"])
+    def test_wait_never_switches_off_a_light_switched_on_during_it(self, then, sensor, optout):
         """A light switched on during the wait (by hand, an automation) is
-        external control: the next evaluation ends the wait in idle without
-        a turn-off, as at runtime (blocked when a sensor is on)."""
+        external control: the next evaluation ends the wait in blocked
+        without a turn-off, as in idle at runtime (9.12.0; 9.11.4 ended it in
+        idle). With block_on_external_on false or disable_block, idle."""
         model, live, _, _ = self._waiting_model(
             -60, {"light.a": "off", "light.b": "unavailable", "input_boolean.ov": "off"}, sensor=sensor,
             overrides=["input_boolean.ov"])
+        if optout == "block_on_external_on":
+            model.block_on_external_on = False
+        elif optout == "disable_block":
+            model.disable_block = True
         wait = model._restore_wait
         live["light.a"] = "on"
         self._later(model._restore_wait_event, wait, self._ev("light.a", "off", "on"))
         assert model.state == "pending" and model._restore_wait is wait
         if then == "comeback":
             live["light.b"] = "off"
-            self._later(model._restore_wait_event, wait, self._ev("light.b", "unavailable", "off"))
+            timer = self._later(model._restore_wait_event, wait, self._ev("light.b", "unavailable", "off"))
         else:
-            self._later(model._restore_wait_event, wait, self._ev("input_boolean.ov", "off", "off"))
+            timer = self._later(model._restore_wait_event, wait, self._ev("input_boolean.ov", "off", "off"))
         assert model._restore_wait is None
         model.turn_off_control_entities.assert_not_called()
-        assert model.state == ("blocked" if sensor == "on" else "idle")
+        model.turn_on_control_entities.assert_not_called()
+        if optout:
+            assert model.state == "idle"
+            timer.assert_not_called()
+        else:
+            assert model.state == "blocked"
+            timer.assert_called_once_with(600, model.block_timer_expire)
 
     @pytest.mark.parametrize("case", ["off", "unknown", "late"])
     def test_wait_settles_a_light_that_comes_back_off_then_on(self, case):
         """Tasmota lights come back 'off' and report their real state 1-2 s
         later. Within state_change_debounce of its comeback the turn on
         settles the timer by the restore rules; later it is someone
-        switching the light on, which the restore never switches off."""
+        switching the light on, which the restore never switches off: the
+        wait ends in blocked (9.12.0)."""
         model, live, _, _ = self._waiting_model(
             -60, {"light.a": "unavailable", "light.b": "off"}, sensor="unknown" if case == "unknown" else "off")
         wait = model._restore_wait
@@ -1221,8 +1238,9 @@ class TestStatePersistence:
         timer = self._later(model._restore_wait_event, wait, self._ev("light.a", "off", "on"))
         if case == "late":
             assert model.state == "pending"
-            self._later(model._restore_wait_settled, wait)
-            assert model.state == "idle"
+            timer = self._later(model._restore_wait_settled, wait)
+            assert model.state == "blocked"
+            timer.assert_called_once_with(600, model.block_timer_expire)
             model.turn_off_control_entities.assert_not_called()
         elif case == "off":  # ran out, every sensor reports off
             assert model.state == "idle"
@@ -1253,6 +1271,35 @@ class TestStatePersistence:
         model.turn_off_control_entities.assert_not_called()
         self._later(model._restore_wait_timeout, wait, None)  # a stale timeout does nothing
         assert model.state == "idle"
+
+    @pytest.mark.parametrize("case", ["block", "opt-out", "switched-back-off"])
+    def test_wait_bound_blocks_a_light_switched_on_during_it(self, case, caplog):
+        """The 5-minute bound ends the wait in blocked when a light switched
+        on during it is still on (9.12.0; 9.11.4 left it on in idle)."""
+        caplog.set_level(logging.WARNING)
+        model, live, _, _ = self._waiting_model(
+            150, {"light.a": "off", "light.b": "unavailable"}, sensor="off")
+        if case == "opt-out":
+            model.block_on_external_on = False
+        wait = model._restore_wait
+        live["light.a"] = "on"
+        self._later(model._restore_wait_event, wait, self._ev("light.a", "off", "on"))
+        if case == "switched-back-off":
+            live["light.a"] = "off"
+            self._later(model._restore_wait_event, wait, self._ev("light.a", "on", "off"))
+        assert model.state == "pending" and model._restore_wait is wait
+        timer = self._later(model._restore_wait_timeout, wait, None)
+        assert model._restore_wait is None
+        model.turn_off_control_entities.assert_not_called()
+        model.turn_on_control_entities.assert_not_called()
+        if case == "block":
+            assert model.state == "blocked"
+            timer.assert_called_once_with(600, model.block_timer_expire)
+        else:
+            assert model.state == "idle"
+            timer.assert_not_called()
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1 and "ending the wait without a turn-off" in warnings[0]
 
     def test_override_that_turns_on_ends_the_wait(self):
         model, live, _, _ = self._waiting_model(
@@ -3176,3 +3223,845 @@ class TestStateChangeDebounce:
             self._fire(later)
         assert model.state == "active_timer"
         model.control.assert_not_called()
+
+    # -- idle: switched on outside EC (9.12.0) --------------------------------
+
+    MOTION = "binary_sensor.motion"
+    TIMER = "custom_components.entity_controller.Timer"
+    NO_SAVE = "custom_components.entity_controller.asyncio.run_coroutine_threadsafe"
+
+    def _idle_live(self, model, on=(), sensor="off", unavailable=()):
+        states = dict.fromkeys(self.ENTITIES, "off")
+        states.update(dict.fromkeys(on, "on"))
+        states.update(dict.fromkeys(unavailable, "unavailable"))
+        states[self.MOTION] = sensor
+        self._set_live(model, states)
+
+    def _idle(self, debounce=3.0):
+        """idle, every light off, block_timeout 1800; the blocked trigger is
+        wrapped so a test can tell B apart from other ways into blocked."""
+        model = self._model("idle", debounce=debounce)
+        model.block_timeout = 1800
+        model.sensor_type = "duration"
+        model.blocked = MagicMock(side_effect=model.blocked)
+        self._idle_live(model)
+        return model
+
+    @staticmethod
+    def _attrs(model):
+        return {c.args[0]: c.args[1] for c in model.entity.set_attr.call_args_list}
+
+    @pytest.mark.parametrize("old", ["off", "unknown", None])
+    def test_idle_external_on_blocks(self, old, caplog):
+        caplog.set_level(logging.INFO)
+        model = self._idle()
+        model.entity.set_attr.reset_mock()
+        with patch(self.LATER) as later, patch(self.TIMER) as timer:
+            self._idle_live(model, on=[self.E108I])
+            model.state_entity_state_change(self._event(self.E108I, old, "on"))
+            assert model.state == "idle"
+            later.assert_called_once()
+            assert later.call_args[0][1] == 3.0
+            model.blocked.assert_not_called()
+            self._fire(later)
+        assert model.state == "blocked"
+        model.blocked.assert_called_once()
+        timer.assert_called_once_with(1800, model.block_timer_expire)
+        timer.return_value.start.assert_called_once()
+        attrs = self._attrs(model)
+        assert attrs["blocked_by"] == self.E108I
+        assert attrs["last_triggered_by"] == self.E108I
+        assert attrs["notes"] == "Switched on outside EC while idle"
+        assert isinstance(attrs["expires_at"], datetime)
+        model.hass.services.async_call.assert_not_called()
+        model.turn_on_control_entities.assert_not_called()
+        model.turn_off_control_entities.assert_not_called()
+        assert model.context.parent_id == "device-ctx"
+        infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert sum("switched on outside EC while idle" in m for m in infos) == 1
+        assert not any("changed for good" in m for m in infos)
+
+    @pytest.mark.parametrize("debounce", [0, None])
+    def test_idle_external_on_without_debounce_blocks_at_once(self, debounce):
+        model = self._idle(debounce=debounce)
+        with patch(self.LATER) as later, patch(self.TIMER) as timer:
+            self._idle_live(model, on=[self.E108I])
+            model.state_entity_state_change(self._event(self.E108I, "off", "on"))
+        assert model.state == "blocked"
+        later.assert_not_called()
+        model.blocked.assert_called_once()
+        timer.assert_called_once_with(1800, model.block_timer_expire)
+        model.hass.services.async_call.assert_not_called()
+
+    @pytest.mark.parametrize("other", ["other-off", "other-on"])
+    def test_idle_second_change_joins_the_window(self, other):
+        """Once an ON edge opened the window, any change joins it."""
+        model = self._idle()
+        with patch(self.LATER) as later, patch(self.TIMER):
+            if other == "other-off":
+                self._idle_live(model, on=[self.E108F])
+            model.state_entity_state_change(self._event(self.E108I, "off", "on"))
+            if other == "other-off":
+                model.state_entity_state_change(self._event(self.E108F, "on", "off"))
+                self._idle_live(model, on=[self.E108I])
+            else:
+                model.state_entity_state_change(self._event(self.E108F, "off", "on"))
+                self._idle_live(model, on=[self.E108I, self.E108F])
+            later.assert_called_once()
+            assert set(model._debounce_window.snapshot) == {self.E108I, self.E108F}
+            self._fire(later)
+        assert model.state == "blocked"
+        model.blocked.assert_called_once()
+        model.turn_off_control_entities.assert_not_called()
+
+    @pytest.mark.parametrize("case", ["bounce", "removed"])
+    def test_idle_bounce_stays_idle(self, case, caplog):
+        """An ON edge that does not persist (back off, or the entity removed)
+        stays idle and logs at DEBUG only: in idle only a take-over logs at INFO."""
+        caplog.set_level(logging.DEBUG)
+        model = self._idle()
+        with patch(self.LATER) as later, patch(self.TIMER) as timer:
+            model.state_entity_state_change(self._event(self.E108I, "off", "on"))
+            if case == "bounce":
+                model.state_entity_state_change(self._event(self.E108I, "on", "off"))
+                self._idle_live(model)
+            else:
+                self._set_live(model, {self.E108I: None, self.E108F: "off", self.PROXY: "off",
+                                       self.MOTION: "off"})
+            later.assert_called_once()
+            self._fire(later)
+        assert model.state == "idle"
+        model.blocked.assert_not_called()
+        timer.assert_not_called()
+        model.hass.services.async_call.assert_not_called()
+        model.turn_off_control_entities.assert_not_called()
+        assert not [r.getMessage() for r in caplog.records
+                    if r.levelno >= logging.INFO and r.name == model.log.name]
+        expected = "is back to its previous state" if case == "bounce" else "is gone - not compared"
+        assert any(r.levelno == logging.DEBUG and expected in r.getMessage() for r in caplog.records)
+
+    def test_idle_only_an_off_persisted_stays_idle(self, caplog):
+        """The ON edge bounced back; another light that went off for good
+        joined the window. Nothing was switched on, so nothing blocks."""
+        caplog.set_level(logging.INFO)
+        model = self._idle()
+        self._idle_live(model, on=[self.E108F])
+        with patch(self.LATER) as later, patch(self.TIMER) as timer:
+            model.state_entity_state_change(self._event(self.E108I, "off", "on"))
+            model.state_entity_state_change(self._event(self.E108I, "on", "off"))
+            model.state_entity_state_change(self._event(self.E108F, "on", "off"))
+            later.assert_called_once()
+            self._idle_live(model)
+            self._fire(later)
+        assert model.state == "idle"
+        model.blocked.assert_not_called()
+        timer.assert_not_called()
+        model.hass.services.async_call.assert_not_called()
+        assert not [r.getMessage() for r in caplog.records
+                    if r.levelno >= logging.INFO and r.name == model.log.name]
+
+    @pytest.mark.parametrize("case", ["own_context", "ignored_source"])
+    def test_idle_filtered_on_arms_nothing(self, case):
+        model = self._idle()
+        if case == "own_context":
+            ev = self._event(self.E108I, "off", "on", ctx="ec_1a2b3c_0123456789abcdef")
+        else:
+            model.ignored_event_sources = ["01JABCDEF"]
+            ev = self._event(self.E108I, "off", "on", ctx="01JABCDEF")
+        self._idle_live(model, on=[self.E108I])
+        with patch(self.LATER) as later, patch(self.TIMER) as timer:
+            model.state_entity_state_change(ev)
+        later.assert_not_called()
+        timer.assert_not_called()
+        model.blocked.assert_not_called()
+        assert model.state == "idle"
+
+    @pytest.mark.parametrize("case", ["relit", "back-off", "ec-call-meanwhile", "clock-back"])
+    def test_idle_on_inside_grace_is_judged_after_it(self, case, caplog):
+        """An ON edge inside the grace period (EC's own echo in idle is an
+        off) opens a window that ends max(debounce, 1 s) after the grace
+        period, at most grace_period + that after the edge. clock-back pins
+        only that cap: after a real wall-clock step back the fire's own grace
+        check still drops the window (README known limit)."""
+        from datetime import timedelta
+        caplog.set_level(logging.DEBUG)
+        model = self._idle()
+        model.grace_period = 5
+        ahead = 3600 if case == "clock-back" else 4
+        model.ignore_state_changes_until = datetime.now() + timedelta(seconds=ahead)
+        with patch(self.LATER) as later, patch(self.TIMER):
+            self._idle_live(model, on=[self.E108I])
+            model.state_entity_state_change(self._event(self.E108I, "off", "on"))
+            later.assert_called_once()
+            delay = later.call_args[0][1]
+            if case == "clock-back":
+                assert delay == 5 + 3.0
+            else:
+                assert 4 + 3.0 - 0.5 < delay <= 4 + 3.0
+            assert any("acting only if it persists for %.1f s" % delay in r.getMessage()
+                       for r in caplog.records)
+            if case == "back-off":
+                model.state_entity_state_change(self._event(self.E108I, "on", "off"))
+                self._idle_live(model)
+            later.assert_called_once()
+            if case == "ec-call-meanwhile":
+                model.ignore_state_changes_until = datetime.now() + timedelta(seconds=5)
+            else:
+                model.ignore_state_changes_until = datetime.now() - timedelta(seconds=1)
+            self._fire(later)
+        expected = "blocked" if case in ("relit", "clock-back") else "idle"
+        assert model.state == expected
+        assert model.blocked.call_count == (1 if expected == "blocked" else 0)
+        model.hass.services.async_call.assert_not_called()
+
+    def test_block_end_by_manual_off_then_relight_blocks(self):
+        """A B-block ended by switching the light off: on_enter_idle's own
+        turn_off arms the grace period, and a re-light 2 s later is judged
+        once it ends (9.12.0 design probe P5: it used to stay on in idle)."""
+        from datetime import timedelta
+        model = self._idle()
+        model.grace_period = 5
+        model.turn_off_control_entities = MagicMock(
+            side_effect=lambda: model.call_service(self.E108I, "turn_off"))
+        with patch(self.LATER) as later, patch(self.TIMER), patch(
+                self.NO_SAVE, side_effect=lambda coro, loop: coro.close()):
+            self._idle_live(model, on=[self.E108I])
+            model.state_entity_state_change(self._event(self.E108I, "off", "on"))
+            self._fire(later, 0)
+            assert model.state == "blocked"
+            self._idle_live(model)
+            model.state_entity_state_change(self._event(self.E108I, "on", "off"))
+            self._fire(later, 1)
+            assert model.state == "idle"
+            model.turn_off_control_entities.assert_called_once()
+            assert model.is_within_grace_period()
+            model.ignore_state_changes_until -= timedelta(seconds=2)  # the re-light, 2 s later
+            self._idle_live(model, on=[self.E108I])
+            model.state_entity_state_change(self._event(self.E108I, "off", "on"))
+            assert later.call_count == 3
+            assert 3 + 3.0 - 0.5 < later.call_args[0][1] <= 3 + 3.0
+            model.ignore_state_changes_until = datetime.now() - timedelta(seconds=1)
+            self._fire(later, 2)
+        assert model.state == "blocked"
+        assert model.blocked.call_count == 2
+
+    @pytest.mark.parametrize("sensor", ["quiet", "sensor-on"])
+    def test_idle_comeback_on_opens_no_window(self, sensor):
+        """unavailable -> on keeps the resync of TestLinkOutage."""
+        model = self._idle()
+        self._idle_live(model, on=[self.E108I], sensor="on" if sensor == "sensor-on" else "off")
+        with patch(self.LATER) as later, patch(self.TIMER):
+            model.state_entity_state_change(self._event(self.E108I, "unavailable", "on"))
+        later.assert_not_called()
+        model.blocked.assert_not_called()
+        if sensor == "quiet":
+            assert model.state == "idle"
+            model.turn_off_control_entities.assert_called_once()
+        else:
+            assert model.state == "active_timer"
+            model.turn_on_control_entities.assert_called_once()
+            model.turn_off_control_entities.assert_not_called()
+
+    @pytest.mark.parametrize("case", ["significant", "ignored"])
+    def test_idle_attribute_change_arms_nothing(self, case):
+        model = self._idle()
+        if case == "ignored":
+            model.state_attributes_ignore = ["brightness"]
+        self._idle_live(model, on=[self.E108F])
+        with patch(self.LATER) as later, patch(self.TIMER) as timer:
+            model.state_entity_state_change(self._event(
+                self.E108F, "on", "on", {"brightness": 100}, {"brightness": 50}))
+        later.assert_not_called()
+        timer.assert_not_called()
+        model.blocked.assert_not_called()
+        assert model.state == "idle"
+        assert model._debounce_window is None
+
+    def test_idle_off_edge_arms_nothing(self):
+        model = self._idle()
+        self._idle_live(model, on=[self.E108I])
+        with patch(self.LATER) as later, patch(self.TIMER) as timer:
+            model.state_entity_state_change(self._event(self.E108F, "on", "off"))
+        later.assert_not_called()
+        timer.assert_not_called()
+        assert model.state == "idle"
+        assert model._debounce_window is None
+        model.turn_off_control_entities.assert_not_called()
+
+    @pytest.mark.parametrize("debounce", [3.0, 0], ids=["debounce", "no-debounce"])
+    @pytest.mark.parametrize("optout", ["block_on_external_on", "disable_block"])
+    def test_idle_external_on_left_alone(self, optout, debounce):
+        model = self._idle(debounce=debounce)
+        if optout == "block_on_external_on":
+            model.block_on_external_on = False
+        else:
+            model.disable_block = True
+        self._idle_live(model, on=[self.E108I])
+        with patch(self.LATER) as later, patch(self.TIMER) as timer:
+            model.state_entity_state_change(self._event(self.E108I, "off", "on"))
+        later.assert_not_called()
+        timer.assert_not_called()
+        model.blocked.assert_not_called()
+        assert model.state == "idle"
+        model.hass.services.async_call.assert_not_called()
+        model.turn_on_control_entities.assert_not_called()
+        model.turn_off_control_entities.assert_not_called()
+
+    @pytest.mark.parametrize("state", ["pending", "constrained", "overridden", "active_timer", "active_stay_on"])
+    def test_external_on_outside_idle_unchanged(self, state):
+        """An external ON edge does what it did before 9.12.0 outside idle."""
+        if state in ("active_timer", "active_stay_on"):
+            model = self._model(state)
+        else:
+            model = self._model("idle")
+            {"pending": model.to_pending, "constrained": model.constrain,
+             "overridden": model.override}[state]()
+        model.block_timeout = 1800
+        model.blocked = MagicMock(side_effect=model.blocked)
+        self._live(model, "on", {self.MOTION: "off"})
+        with patch(self.LATER) as later, patch(self.TIMER):
+            model.state_entity_state_change(self._event(self.E108I, "off", "on"))
+            if state in ("pending", "constrained", "overridden"):
+                later.assert_not_called()
+            else:
+                later.assert_called_once()
+                assert model._debounce_window.state == state
+                self._fire(later)
+        model.blocked.assert_not_called()
+        if state == "active_timer":
+            model.control.assert_called_once()
+            assert model.state == "blocked"
+        elif state == "active_stay_on":
+            model.enable.assert_called_once()
+            assert model.state == "active_stay_on"
+        else:
+            assert model.state == state
+            model.control.assert_not_called()
+            model.enable.assert_not_called()
+
+    @pytest.mark.parametrize("leave", ["sensor_on", "override", "constrain", "force_activate", "back-to-idle"])
+    def test_idle_window_dropped_when_ec_leaves_idle(self, leave):
+        model = self._idle()
+        with patch(self.LATER) as later, patch(self.TIMER):
+            self._idle_live(model, on=[self.E108I])
+            model.state_entity_state_change(self._event(self.E108I, "off", "on"))
+            if leave == "back-to-idle":
+                model.constrain()
+                model.enable()
+                assert model.state == "idle" and model._debounce_window is None
+            else:
+                getattr(model, leave)()
+            left_to = model.state
+            self._fire(later)
+        assert model.state == left_to
+        model.blocked.assert_not_called()
+
+    def test_idle_reboot_off_then_on_blocks(self):
+        """A rebooting relay returns 'off', then reports 'on': B (D12)."""
+        model = self._idle()
+        with patch(self.LATER) as later, patch(self.TIMER):
+            model.state_entity_state_change(self._event(self.E108I, "unavailable", "off"))
+            later.assert_not_called()
+            self._idle_live(model, on=[self.E108I])
+            model.state_entity_state_change(self._event(self.E108I, "off", "on"))
+            self._fire(later)
+        assert model.state == "blocked"
+        model.turn_off_control_entities.assert_not_called()
+
+    def test_known_limitation_comeback_via_unknown_blocks(self):
+        """Known limit: unavailable -> unknown -> on is a B, while
+        unavailable -> on is the comeback resync."""
+        model = self._idle()
+        with patch(self.LATER) as later, patch(self.TIMER):
+            model.state_entity_state_change(self._event(self.E108I, "unavailable", "unknown"))
+            later.assert_not_called()
+            self._idle_live(model, on=[self.E108I])
+            model.state_entity_state_change(self._event(self.E108I, "unknown", "on"))
+            self._fire(later)
+        assert model.state == "blocked"
+        model.turn_off_control_entities.assert_not_called()
+
+    def test_known_limitation_unavailable_at_deadline_stays_idle(self):
+        """Known limit: the only lit light is unavailable at the deadline, so
+        no state entity reads on; its comeback is then resynced."""
+        model = self._idle()
+        with patch(self.LATER) as later, patch(self.TIMER) as timer:
+            self._idle_live(model, on=[self.E108I])
+            model.state_entity_state_change(self._event(self.E108I, "off", "on"))
+            model.state_entity_state_change(self._event(self.E108I, "on", "unavailable"))
+            self._idle_live(model, unavailable=[self.E108I])
+            self._fire(later)
+        assert model.state == "idle"
+        model.blocked.assert_not_called()
+        timer.assert_not_called()
+
+    def test_idle_external_on_block_is_saved(self):
+        """B10: a B-block is saved as blocked (restored by
+        test_async_restore_blocked_with_a_light_on_leaves_it_on)."""
+        model = self._idle()
+        model._store = MagicMock()
+        model._store.async_save = AsyncMock()
+        with patch(self.LATER) as later, patch(self.TIMER), patch(self.NO_SAVE) as schedule:
+            self._idle_live(model, on=[self.E108I])
+            model.state_entity_state_change(self._event(self.E108I, "off", "on"))
+            self._fire(later)
+        assert model.state == "blocked"
+        schedule.assert_called_once()
+        coro, loop = schedule.call_args.args
+        assert loop is model.hass.loop
+        asyncio.run(coro)
+        assert model._store.async_save.call_args[0][0]["state"] == "blocked"
+
+    @pytest.mark.parametrize("cfg, expected, errors", [
+        ({}, True, 0),
+        ({"block_on_external_on": False}, False, 0),
+        ({"block_on_external_on": True}, True, 0),
+        ({"block_on_external_on": "false"}, True, 1),
+        ({"block_on_external_on": None}, True, 1),
+        ({"block_on_external_on": 0}, True, 1),
+        ({"block_on_external_on": 1}, True, 1),
+        ({"block_on_external_on": "yes"}, True, 1),
+    ], ids=["default", "false", "true", "str-false", "null", "zero", "one", "str-yes"])
+    def test_block_on_external_on_parsing(self, caplog, cfg, expected, errors):
+        caplog.set_level(logging.INFO)
+        model = _build_model()
+        model.config_other(cfg)
+        assert model.block_on_external_on is expected
+        assert sum(r.levelno == logging.ERROR for r in caplog.records) == errors
+        infos = [r for r in caplog.records
+                 if r.levelno == logging.INFO and "block_on_external_on is false" in r.getMessage()]
+        assert len(infos) == (0 if expected else 1)
+        model.entity.set_attr.assert_any_call("block_on_external_on", expected)
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-10 – a block taken over in idle: hold sensors, expiry, turn-off
+# ---------------------------------------------------------------------------
+
+class TestBlockedHoldSensors:
+    """In blocked, a hold sensor's ON edge restarts the block timer in place,
+    at most once per 60 s and within hold_max_seconds of the block start or
+    the last regular-sensor edge; the expiry rules after a take-over; a stale
+    block timer; the turn-off at the end of a block that ends in idle."""
+
+    L1, L2 = "light.a", "light.b"
+    W, BED, READING = "light.205_wardrobe", "light.205_bed", "light.205_reading"
+    PIR, RADAR = "binary_sensor.pir", "binary_sensor.radar"
+    LATER = "custom_components.entity_controller.event.async_call_later"
+    TIMER = "custom_components.entity_controller.Timer"
+    NO_SAVE = "custom_components.entity_controller.asyncio.run_coroutine_threadsafe"
+
+    def _timer(self):
+        """Timer patched; every Timer(...) is a fresh mock."""
+        return patch(self.TIMER, side_effect=lambda *a, **k: MagicMock())
+
+    def _no_save(self):
+        return patch(self.NO_SAVE, side_effect=lambda coro, loop: coro.close())
+
+    @staticmethod
+    def _event(entity, old, new, ctx="device-ctx"):
+        ev = MagicMock()
+        ev.data = {
+            "entity_id": entity,
+            "old_state": None if old is None else MagicMock(state=old, attributes={}),
+            "new_state": MagicMock(state=new, attributes={}, context=MagicMock(id=ctx)),
+        }
+        return ev
+
+    def _get(self, entity):
+        s = self.live.get(entity)
+        if s is None:
+            return None
+        return MagicMock(state=s, attributes={}, last_changed=self.changed.get(entity, self.now))
+
+    def _model(self, control=(L1, L2), night=(), extra_state=(), sensor_type="duration"):
+        from homeassistant.util import dt as dt_util
+        model = _build_model()
+        model.controlEntities = list(control)
+        model.nightControlEntities = list(night)
+        model.stateEntities = list(control) + list(night) + list(extra_state)
+        model.activeControlEntities = list(control)
+        model.sensor_type = sensor_type
+        model.sensorEntities = [self.PIR]
+        model.holdSensorEntities = [self.RADAR]
+        model.hold_max_seconds = 7200
+        model.block_timeout = 1800
+        model.turn_on_control_entities = MagicMock()
+        model.turn_off_control_entities = MagicMock()
+        self.now = dt_util.utcnow()
+        self.changed = {}
+        self.live = dict.fromkeys(model.stateEntities + [self.PIR, self.RADAR], "off")
+        model.hass.states.get = MagicMock(side_effect=self._get)
+        return model
+
+    def _take_over(self, model, light):
+        """idle -> blocked through an external ON and its debounce window."""
+        with patch(self.LATER) as later:
+            self.live[light] = "on"
+            model.state_entity_state_change(self._event(light, "off", "on"))
+            later.call_args[0][2](None)
+        assert model.state == "blocked"
+
+    def _blocked(self, sensor_type="duration"):
+        model = self._model(sensor_type=sensor_type)
+        self._take_over(model, self.L1)
+        return model
+
+    @staticmethod
+    def _service_targets(model, service):
+        return [c.args[2]["entity_id"] for c in model.hass.services.async_call.call_args_list
+                if c.args[1] == service]
+
+    # -- hold sensors in blocked ----------------------------------------------
+
+    def test_hold_on_edge_restarts_block_timer_in_place(self):
+        from unittest.mock import call
+        with self._timer() as timer:
+            model = self._blocked()
+            old = model.block_timer_handle
+            model._block_timer_started -= 61
+            model.do_transition_behaviour = MagicMock(side_effect=model.do_transition_behaviour)
+            model._schedule_save_state = MagicMock()
+            model.entity.set_attr.reset_mock()
+            self.live[self.RADAR] = "on"
+            model.hold_sensor_state_change(self._event(self.RADAR, "off", "on"))
+        assert model.state == "blocked"
+        old.cancel.assert_called_once()
+        assert timer.call_args_list == [call(1800, model.block_timer_expire)] * 2
+        assert model.block_timer_handle is not old
+        model.block_timer_handle.start.assert_called_once()
+        attrs = {c.args[0]: c.args[1] for c in model.entity.set_attr.call_args_list}
+        assert isinstance(attrs["expires_at"], datetime)
+        assert attrs["notes"] == "Hold sensor binary_sensor.radar is on, block timer restarted"
+        assert "last_triggered_by" not in attrs and "blocked_at" not in attrs
+        model.do_transition_behaviour.assert_not_called()
+        model._schedule_save_state.assert_not_called()
+        model.hass.services.async_call.assert_not_called()
+        model.turn_on_control_entities.assert_not_called()
+        model.turn_off_control_entities.assert_not_called()
+
+    def test_hold_edges_are_throttled(self):
+        """A flapping radar restarts the block timer at most once a minute."""
+        with self._timer() as timer:
+            model = self._blocked()
+            self.live[self.RADAR] = "on"
+            ev = self._event(self.RADAR, "off", "on")
+            for _ in range(100):
+                model.hold_sensor_state_change(ev)
+            assert timer.call_count == 1  # only the block start
+            model._block_timer_started -= 61
+            for _ in range(100):
+                model.hold_sensor_state_change(ev)
+        assert timer.call_count == 2
+        assert model.state == "blocked"
+
+    @pytest.mark.parametrize("case", ["no-regular-edge", "regular-edge-resets", "cap-null"])
+    def test_hold_rearm_bounded_by_hold_max_seconds(self, case, caplog):
+        """A hold sensor keeps a block only within hold_max_seconds of the
+        block start or the last regular-sensor edge (null: no bound)."""
+        caplog.set_level(logging.DEBUG)
+        with self._timer() as timer:
+            model = self._blocked()
+            if case == "cap-null":
+                model.hold_max_seconds = None
+            model._block_timer_started -= 61
+            model._block_anchor -= 7300
+            self.live[self.RADAR] = "on"
+            ev = self._event(self.RADAR, "off", "on")
+            model.hold_sensor_state_change(ev)
+            restarts = timer.call_count - 1
+            if case == "regular-edge-resets":
+                self.live[self.PIR] = "on"
+                model.sensor_state_change(self._event(self.PIR, "off", "on"))
+                assert model.state == "blocked" and timer.call_count == 2  # re-entry
+                model._block_timer_started -= 61
+                model.hold_sensor_state_change(ev)
+                assert timer.call_count == 3
+        if case == "cap-null":
+            assert restarts == 1
+        else:
+            assert restarts == 0
+            assert any("the block runs out" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("state", ["idle", "constrained", "overridden", "pending"])
+    def test_hold_on_edge_outside_blocked_does_nothing(self, state):
+        with self._timer() as timer:
+            model = self._model()
+            self.live[self.L1] = "on"
+            if state != "idle":
+                {"constrained": model.constrain, "overridden": model.override,
+                 "pending": model.to_pending}[state]()
+            self.live[self.RADAR] = "on"
+            model.hold_sensor_state_change(self._event(self.RADAR, "off", "on"))
+        assert model.state == state
+        timer.assert_not_called()
+        model.hass.services.async_call.assert_not_called()
+        model.turn_on_control_entities.assert_not_called()
+        model.turn_off_control_entities.assert_not_called()
+
+    def test_hold_off_in_blocked_does_nothing(self):
+        with self._timer() as timer:
+            model = self._blocked()
+            model._block_timer_started -= 61
+            model._schedule_save_state = MagicMock()
+            self.live[self.RADAR] = "off"
+            model.hold_sensor_state_change(self._event(self.RADAR, "on", "off"))
+        assert model.state == "blocked"
+        assert timer.call_count == 1
+        model.block_timer_handle.cancel.assert_not_called()
+        model._schedule_save_state.assert_not_called()
+        model.hass.services.async_call.assert_not_called()
+
+    def test_hold_rules_in_active_timer_unchanged(self):
+        model = self._model()
+        model.sensor_on()
+        assert model.state == "active_timer"
+        model._cancel_timer.reset_mock()
+        model._start_timer.reset_mock()
+        model.entity.set_attr.reset_mock()
+        self.live[self.RADAR] = "on"
+        model.hold_sensor_state_change(self._event(self.RADAR, "off", "on"))
+        model._cancel_timer.assert_called_once()
+        model._start_timer.assert_not_called()
+        model.entity.set_attr.assert_any_call("expires_at", "pending sensor")
+        self.live[self.RADAR] = "off"
+        model.hold_sensor_state_change(self._event(self.RADAR, "on", "off"))
+        model._start_timer.assert_called_once()
+        assert model.state == "active_timer"
+
+    def test_blocked_hold_edge_keeps_check(self):
+        """A hold restart is no re-entry: a pending check of blocked survives it."""
+        with self._timer(), patch(self.LATER) as later:
+            model = self._blocked()
+            self.live[self.L1] = "off"
+            model.state_entity_state_change(self._event(self.L1, "on", "off"))
+            window = model._debounce_window
+            assert window is not None and window.state == "blocked"
+            model._block_timer_started -= 61
+            self.live[self.RADAR] = "on"
+            model.hold_sensor_state_change(self._event(self.RADAR, "off", "on"))
+            assert model._debounce_window is window and model.state == "blocked"
+            later.call_args[0][2](None)
+        assert model.state == "idle"
+        model.turn_off_control_entities.assert_called_once()
+
+    # -- the block timer ---------------------------------------------------------
+
+    @pytest.mark.parametrize("case", ["idle-after-expiry", "replaced-handle"])
+    def test_stale_block_timer_does_nothing(self, case):
+        current = "custom_components.entity_controller.current_thread"
+        with self._timer():
+            model = self._blocked()
+            if case == "idle-after-expiry":
+                model.block_timer_expires()
+                assert model.state == "idle"
+                model.turn_off_control_entities.reset_mock()
+                model.block_timer_expire()  # a timer that was not cancelled; MachineError before 9.12.0
+                assert model.state == "idle"
+                model.turn_off_control_entities.assert_not_called()
+            else:
+                handle = model.block_timer_handle
+                handle.function = model.block_timer_expire
+                with patch(current, return_value=MagicMock(function=model.block_timer_expire)):
+                    model.block_timer_expire()  # a replaced timer's thread
+                assert model.state == "blocked"
+                model.turn_off_control_entities.assert_not_called()
+                with patch(current, return_value=handle):
+                    model.block_timer_expire()  # the current timer's thread
+                assert model.state == "idle"
+                model.turn_off_control_entities.assert_called_once()
+
+    def test_real_timer_stale_guard(self):
+        """Real threading.Timer threads, each joined before its asserts: a
+        stray timer with the same function is ignored, the timer replaced by
+        a hold restart never runs, and the current one ends the block."""
+        import threading
+        model = self._model()
+        model.block_timeout = 60  # long: must not run out during the test
+        timers = []
+        try:
+            self._take_over(model, self.L1)
+            first = model.block_timer_handle
+            timers.append(first)
+            assert isinstance(first, threading.Timer) and first.is_alive()
+            stray = threading.Timer(0.01, model.block_timer_expire)
+            timers.append(stray)
+            stray.start()
+            stray.join(10)
+            assert not stray.is_alive() and model.state == "blocked"
+            model.block_timeout = 0.2
+            model._block_timer_started -= 61
+            # the radar reads off again by the time the new timer runs out
+            model.hold_sensor_state_change(self._event(self.RADAR, "off", "on"))
+            second = model.block_timer_handle
+            timers.append(second)
+            assert second is not first
+            first.join(10)
+            assert not first.is_alive()  # cancelled
+            second.join(10)
+            assert not second.is_alive()
+        finally:
+            for t in timers:
+                t.cancel()
+                t.join(10)
+        assert model.state == "idle"
+        model.turn_off_control_entities.assert_called_once()
+        assert model.block_timer_handle is None
+
+    def test_no_block_timeout_take_over(self):
+        """block_timeout unset: B still blocks, without a timer; a hold edge
+        does nothing; switching the light off ends the block as usual."""
+        with self._timer() as timer, patch(self.LATER) as later:
+            model = self._model()
+            model.block_timeout = None
+            self.live[self.L1] = "on"
+            model.state_entity_state_change(self._event(self.L1, "off", "on"))
+            later.call_args[0][2](None)
+            assert model.state == "blocked"
+            timer.assert_not_called()
+            self.live[self.RADAR] = "on"
+            model.hold_sensor_state_change(self._event(self.RADAR, "off", "on"))
+            timer.assert_not_called()
+            self.live[self.L1] = "off"
+            model.state_entity_state_change(self._event(self.L1, "on", "off"))
+            later.call_args[0][2](None)
+        assert model.state == "idle"
+        model.turn_off_control_entities.assert_called_once()
+
+    def test_block_expiry_racing_a_hold_restart_raises_nothing(self):
+        """The expiring timer's worker leaves blocked (on_exit_blocked clears
+        the handle) while a hold restart is between setting the new handle
+        and starting it: no AttributeError ('NoneType' has no 'start').
+        Deterministic interleave: the restart's loop.time() read runs the
+        worker's transition."""
+        created = []
+
+        def make_timer(*_args, **_kwargs):
+            created.append(MagicMock())
+            return created[-1]
+
+        with patch(self.TIMER, side_effect=make_timer):
+            model = self._blocked()
+            model._block_timer_started -= 61
+            real_time, reads = model.hass.loop.time, []
+
+            def time_with_expiry():
+                reads.append(None)
+                if len(reads) == 2:  # in _start_block_timer, after the new handle is set
+                    model.block_timer_expires()  # the worker, past the stale guard
+                return real_time()
+
+            self.live[self.RADAR] = "on"
+            with patch.object(model.hass.loop, "time", side_effect=time_with_expiry):
+                model.hold_sensor_state_change(self._event(self.RADAR, "off", "on"))
+        assert len(reads) == 2
+        assert model.state == "active_timer"  # the radar holds at the expiry: adopted
+        first, second = created
+        first.cancel.assert_called()
+        second.cancel.assert_called_once()  # by the worker's on_exit_blocked
+        second.start.assert_called_once()  # a cancelled Timer's thread runs nothing
+        assert model.block_timer_handle is None
+
+    def test_external_on_block_expiry_quiet_turns_off_once(self):
+        with self._timer():
+            model = self._blocked()
+            model.block_timer_expire()
+        assert model.state == "idle"
+        model.turn_off_control_entities.assert_called_once()
+        model.turn_on_control_entities.assert_not_called()
+
+    @pytest.mark.parametrize("holder", ["sensor", "hold-fresh"])
+    def test_external_on_block_expiry_held_adopts(self, holder):
+        with self._timer():
+            model = self._blocked()
+            self.live[self.PIR if holder == "sensor" else self.RADAR] = "on"
+            model.block_timer_expire()
+        assert model.state == "active_timer"
+        model.turn_on_control_entities.assert_called_once()
+        model.turn_off_control_entities.assert_not_called()
+
+    def test_external_on_block_expiry_adopts_the_whole_mode_set(self):
+        """Adopting switches on every control entity of the mode, not only
+        the one switched on outside EC (existing behaviour, README)."""
+        with self._timer(), self._no_save():
+            model = self._blocked()
+            del model.turn_on_control_entities
+            self.live[self.PIR] = "on"
+            model.hass.services.async_call.reset_mock()
+            model.block_timer_expire()
+        assert model.state == "active_timer"
+        assert sorted(self._service_targets(model, "turn_on")) == [self.L1, self.L2]
+
+    def test_external_on_block_expiry_with_stuck_hold_turns_off(self, caplog):
+        from datetime import timedelta
+        caplog.set_level(logging.WARNING)
+        with self._timer():
+            model = self._blocked()
+            self.live[self.RADAR] = "on"
+            self.changed[self.RADAR] = self.now - timedelta(seconds=7300)
+            model.block_timer_expire()
+        assert model.state == "idle"
+        model.turn_off_control_entities.assert_called_once()
+        model.turn_on_control_entities.assert_not_called()
+        assert any("treating it as stuck" in r.getMessage() for r in caplog.records)
+
+    def test_external_on_block_expiry_event_sensor_adopts(self):
+        with self._timer():
+            model = self._blocked(sensor_type="event")
+            model.block_timer_expire()
+        assert model.state == "active_timer"
+        model.turn_on_control_entities.assert_called_once()
+        model.turn_off_control_entities.assert_not_called()
+
+    # -- the turn-off at the end of a block -----------------------------------
+
+    @pytest.mark.parametrize("active, switched, expected", [
+        ([W], BED, [W, BED]), ([BED], W, [BED, W]),
+    ], ids=["day-set-bed-lit", "night-set-main-lit"])
+    def test_block_end_turns_off_lit_targets_of_both_modes(self, active, switched, expected):
+        """ec_205: a block that ends in idle also switches off a lit target
+        of the other mode; an explicit state entity is never a target."""
+        with self._timer(), self._no_save():
+            model = self._model(control=[self.W], night=[self.BED], extra_state=[self.READING])
+            model.activeControlEntities = list(active)
+            del model.turn_off_control_entities
+            self.live[self.READING] = "on"
+            self._take_over(model, switched)
+            model.hass.services.async_call.reset_mock()
+            model.block_timer_expire()
+        assert model.state == "idle"
+        assert self._service_targets(model, "turn_off") == expected
+        assert model._block_ending is False
+
+    @pytest.mark.parametrize("case", ["adoption", "override-off"])
+    def test_block_end_flag_is_cleared(self, case):
+        """Only a turn-off in the trigger that ends the block in idle is
+        widened: not a later timer run-out, not an override's own turn-off."""
+        with self._timer(), self._no_save():
+            model = self._model(control=[self.W], night=[self.BED])
+            model.activeControlEntities = [self.W]
+            del model.turn_off_control_entities
+            self._take_over(model, self.BED)
+            model.hass.services.async_call.reset_mock()
+            if case == "adoption":
+                self.live[self.PIR] = "on"
+                model.block_timer_expire()
+                assert model.state == "active_timer" and model._block_ending is False
+                self.live[self.PIR] = "off"
+                model.timer_expires()
+                assert model.state == "idle"
+            else:
+                model.transition_behaviours["on_enter_overridden"] = "off"
+                model.override()
+                assert model.state == "overridden"
+        assert self._service_targets(model, "turn_off") == [self.W]
+        assert model._block_ending is False
+
+    def test_start_time_during_external_on_block_stays_blocked(self, caplog):
+        """Pinned: start_time inside a block logs the existing WARNING."""
+        caplog.set_level(logging.WARNING)
+        with self._timer():
+            model = self._blocked()
+            model._apply_start_time_transition()
+        assert model.state == "blocked"
+        assert any("no transition from state 'blocked'" in r.getMessage() for r in caplog.records)

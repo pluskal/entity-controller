@@ -110,6 +110,9 @@ CONF_STATE_ENTITIES = "state_entities"
 CONF_DELAY = "delay"
 CONF_BLOCK_TIMEOUT = "block_timeout"
 CONF_DISABLE_BLOCK = "disable_block"
+# A state entity switched on outside EC while EC is idle puts EC in blocked
+# (2026-11-10); false leaves such a light alone.
+CONF_BLOCK_ON_EXTERNAL_ON = "block_on_external_on"
 CONF_SENSOR_TYPE_DURATION = "sensor_type_duration"
 CONF_SENSOR_TYPE = "sensor_type"
 CONF_SENSOR_RESETS_TIMER = "sensor_resets_timer"

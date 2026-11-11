@@ -155,9 +155,9 @@ EC persists its state across Home Assistant restarts using the built-in HA stora
 
 - A restored `blocked` state leaves the lights as they are and re-arms the block timer.
 - A restored timer never switches the lights off at startup while a sensor or hold sensor is on or has not reported yet (Zigbee2MQTT sensors are often still `unknown` then). It resumes with the time that was left, but at least the configured `delay` while a sensor has not reported, and with the `delay` (the night delay at night) when it had run out by the restart. Only a timer that ran out with every sensor reporting off switches the lights off, once. The resumed time never exceeds the longest timer the instance can run (the day or night `delay`, `backoff_max` with `backoff: true`): the saved time is local wall-clock time, which a daylight-saving change or a clock step would otherwise stretch.
-- A light that is still `unavailable` or `unknown` does not stop the timer while another light is on. When one returns from `unavailable`, the usual comeback resync applies (one that returns off is switched on while the timer runs); one that was still `unknown` is treated as described under Known limits. When no reachable light is on and some have not reported yet, EC waits in `pending` for up to 5 minutes: the first light that returns on resumes the timer as above, lights that all return off end in `idle` without a turn-off once they have stayed off for `state_change_debounce` (a Tasmota light reports a placeholder `off` 1–2 s before its real state, which then settles the timer as above), and after 5 minutes EC starts in `idle` without switching anything off. When the wait ends in `idle` and a regular (non-hold) sensor is on, EC acts on it as on a new motion edge (the edge itself is not seen during the wait). A light switched on during the wait (by hand or an automation) is not switched off by the restore: the wait then ends in `idle`, as for any light switched on outside EC. This does not hold for a turn-on within `state_change_debounce` of that light's own return, which counts as its real state as above, nor across a stop of Home Assistant during the wait: the next start treats the light as EC's. An override that turns on, the end of the start/end window (constrain) or a forced sensor ends the wait.
+- A light that is still `unavailable` or `unknown` does not stop the timer while another light is on. When one returns from `unavailable`, the usual comeback resync applies (one that returns off is switched on while the timer runs); one that was still `unknown` is treated as described under Known limits. When no reachable light is on and some have not reported yet, EC waits in `pending` for up to 5 minutes: the first light that returns on resumes the timer as above, lights that all return off end in `idle` without a turn-off once they have stayed off for `state_change_debounce` (a Tasmota light reports a placeholder `off` 1–2 s before its real state, which then settles the timer as above), and after 5 minutes EC starts in `idle` without switching anything off. When the wait ends in `idle` and a regular (non-hold) sensor is on, EC acts on it as on a new motion edge (the edge itself is not seen during the wait). A light switched on during the wait (by hand or an automation) is not switched off by the restore: the wait then ends in `blocked`, also at the 5-minute bound while that light is still on, as for any light switched on outside EC while `idle` (see Block on External ON; with `block_on_external_on: false` or `disable_block: true` it ends in `idle`). This does not hold for a turn-on within `state_change_debounce` of that light's own return, which counts as its real state as above, nor across a stop of Home Assistant during the wait: the next start treats the light as EC's. An override that turns on, the end of the start/end window (constrain) or a forced sensor ends the wait.
 
-Known limits: after a crash (no clean stop) EC restores the last saved state, which can be old; the resumed time is then bounded as above. A light that is still `unknown` when the timer resumes is treated as an external change when it first reports, so EC may go `blocked`. A light that is still `unknown` when the 5-minute wait ends, and then reports on, stays on until the next sensor activity. Motion during the wait lights the room only when the wait ends.
+Known limits: after a crash (no clean stop) EC restores the last saved state, which can be old; the resumed time is then bounded as above. A light that is still `unknown` when the timer resumes is treated as an external change when it first reports, so EC may go `blocked`. A light that is still `unknown` when the 5-minute wait ends, and then reports on, counts as switched on outside EC: EC goes `blocked`, and the light goes off when the block ends in an empty room (with `block_on_external_on: false` it stays on until the next sensor activity). Motion during the wait lights the room only when the wait ends.
 
 No configuration is required — persistence is enabled automatically.
 
@@ -169,7 +169,7 @@ Prior to v9.8.0, when the block timer expired while all state entities were alre
 
 **Problem:** Cloud and gateway integrations — such as [Tahoma / Somfy](https://www.home-assistant.io/integrations/tahoma/) — update entity states asynchronously by polling the cloud. When EC calls `light.turn_on`, the integration sends the command upstream and only confirms the new state seconds later through its next poll cycle. That delayed state-change event is emitted with a fresh HA context that has no relationship to the original EC service call. Because EC's self-suppression mechanism (`is_ignored_context`) looks for its own context id prefix, it misses the late-arriving event, fires `control()`, finds the state entity on, and transitions `active_timer → blocked`.
 
-**Solution:** Set `grace_period` to a value (in seconds) that covers the integration's worst-case round-trip latency. EC will then ignore all state-entity changes that arrive within that window after any service call, preventing false `blocked` transitions.
+**Solution:** Set `grace_period` to a value (in seconds) that covers the integration's worst-case round-trip latency. EC will then ignore all state-entity changes that arrive within that window after any service call, preventing false `blocked` transitions (in `idle`, an ON edge is judged after the grace period ends instead; see Block on External ON).
 
 ```yaml
 entity_controller:
@@ -186,7 +186,7 @@ entity_controller:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `grace_period` | integer (seconds) | `null` (disabled) | Duration after each service call during which state-entity changes are ignored. Set to a value slightly above your integration's worst-case latency. |
+| `grace_period` | integer (seconds) | `null` (disabled) | Duration after each service call during which state-entity changes are ignored (in `idle`, an ON edge is judged after it ends instead; see Block on External ON). Set to a value slightly above your integration's worst-case latency. |
 
 **When to use it:** Only needed for integrations where state-change events arrive with a context unrelated to the original EC service call (cloud integrations, gateway bridges, etc.). Standard local integrations — where HA propagates the service-call context through to the state-change event — are handled correctly by the existing context check and do not need this option.
 
@@ -194,16 +194,16 @@ entity_controller:
 
 **Problem:** Some devices report a short `on -> off -> on` bounce (a relay re-reporting, a Wi-Fi blip) with a context that is not EC's own. EC read the first edge as manual control. In `active_timer` it went to `blocked`, or to `idle` (switching the lights off) if nothing else was on, or restarted the timer under `disable_block`. In `blocked`/`active_stay_on` the bounce of the last lit entity sent EC to `idle`, switching the light off.
 
-**Solution:** After an external change of a state entity in `active_timer`, `blocked` or `active_stay_on`, EC waits `state_change_debounce` seconds. It then compares every entity that changed with its state before the first change. If all of them are back, the change is ignored; otherwise EC reacts once, as before. The window starts at the first change, and later changes do not extend it.
+**Solution:** After an external change of a state entity in `active_timer`, `blocked` or `active_stay_on`, and in `idle` for a light switched on (see Block on External ON), EC waits `state_change_debounce` seconds. It then compares every entity that changed with its state before the first change. If all of them are back, the change is ignored; otherwise EC reacts once, as before. The window starts at the first change, and later changes do not extend it.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `state_change_debounce` | number (seconds, 0-60) | `3` | How long an external change must persist before EC reacts. `0` or `null` reacts immediately (behaviour before 9.11.3). A boolean, a non-number, NaN or a value outside 0-60 logs an error and uses 3. |
+| `state_change_debounce` | number (seconds, 0-60) | `3` | How long an external change must persist before EC reacts. `0` or `null` reacts immediately (behaviour before 9.11.3; in `idle`, an ON edge blocks at once). A boolean, a non-number, NaN or a value outside 0-60 logs an error and uses 3. |
 
-- Changes that EC already ignores never open the window: its own context or an `ignored_event_sources` match, `grace_period`, a drop to or return from `unavailable` (a return is resynced instead), and attributes listed in `state_attributes_ignore`.
+- Changes that EC already ignores never open the window: its own context or an `ignored_event_sources` match, `grace_period` (in `idle`, an ON edge is judged after the grace period ends instead), a drop to or return from `unavailable` (a return is resynced instead), and attributes listed in `state_attributes_ignore`. In `idle`, anything but an ON edge opens no window; once one is open, every change outside the grace period joins it (inside it, only an ON edge does).
 - When only attributes changed, attributes are compared. Once the state itself changed, only the state is.
 - An entity that is `unavailable` at the end of the window is judged by the last state it reported in the window. A removed entity is skipped.
-- The check is dropped if EC left `active_timer`/`active_stay_on`, entered `idle`, or is in another state at the deadline. A window opened in `blocked` survives a motion onset that re-enters `blocked` (intended) and a `blocked` -> `constrained` -> `blocked` round trip inside the window (a known gap). The check is also dropped if `grace_period` is set and that grace period is still running at the deadline, which means EC called a service in the meantime.
+- The check is dropped if EC left the state it was opened in, entered `idle`, or is in another state at the deadline. A window opened in `blocked` survives a motion onset that re-enters `blocked` (intended), a hold-sensor restart of the block timer, and a `blocked` -> `constrained` -> `blocked` round trip inside the window (a known gap). The check is also dropped if `grace_period` is set and that grace period is still running at the deadline, which means EC called a service in the meantime.
 
 Known limits (set `0` on an instance where one of them matters; `0` also removes the settle window of a restored timer's wait, so a light that returns with a placeholder `off` then ends that wait, see State Persistence):
 
@@ -212,3 +212,50 @@ Known limits (set `0` on an instance where one of them matters; `0` also removes
 - An entity may return from `unavailable` inside the window while the timer runs. EC's resync then turns the lights back on, and the change is usually lost.
 - A Home Assistant restart inside the window drops the pending check.
 - After a real external off, a motion onset or `entity_controller.activate` that arrives inside the window only restarts the timer; at the deadline EC goes to `idle` and the light stays off until the next sensor onset (before 9.11.3 it was re-lit at once).
+
+## Block on External ON (`block_on_external_on`)
+
+**Problem:** A light switched on outside EC (a wall switch, the app, another automation) while EC was `idle` was left alone. EC noticed it only at the next motion onset, which put EC in `blocked`; when nobody came, the light stayed on until someone switched it off.
+
+**Solution:** EC takes such a light over. When a state entity goes from `off`, `unknown` or no state to `on` with a context that is not EC's own, and is still on after `state_change_debounce`, EC goes from `idle` to `blocked` and starts the `block_timeout` timer. Without `block_timeout`, the block lasts until the lights are switched off, as any block. The take-over itself makes no service call. When the block ends with nobody in the room, EC switches the light off.
+
+```yaml
+entity_controller:
+  bedroom:
+    sensor: binary_sensor.bedroom_motion
+    entity: light.bedroom_reading
+    block_timeout: 1800
+    block_on_external_on: false   # leave a lamp switched on by hand alone
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `block_on_external_on` | boolean | `true` | Take over a light switched on outside EC while EC is `idle` (go to `blocked`). Only a YAML `true`/`false` is accepted; anything else (a quoted `"false"`, `0`, `null`) logs an error and uses `true`. The value is shown as the `block_on_external_on` attribute; `false` is also logged at startup (INFO). |
+
+What counts:
+
+- The ON edge is judged like any external change (see State-Change Debounce): the light must still be on when the window ends, so `off -> on -> off` inside the window changes nothing. With `state_change_debounce` `0`/`null`, the ON edge blocks at once.
+- An ON edge inside `grace_period` (EC's own echo in `idle` is an off) is not dropped: it is judged `state_change_debounce` seconds (at least 1 s) after the grace period ends, unless EC called a service in the meantime.
+- It does not count: EC's own context or an `ignored_event_sources` match, a return from `unavailable` (the comeback resync applies: off when the room is quiet, adopted when a sensor is on), an attribute-only change, an off edge, any change outside `idle` (handled as before), and anything with `block_on_external_on: false` or `disable_block: true`.
+- The take-over logs `<light> switched on outside EC while idle; blocked` (INFO) and sets `last_triggered_by` and `notes` ("Switched on outside EC while idle"); `blocked_by` names the first state entity that is on. An ON edge that does not persist logs at DEBUG only.
+
+How the block ends:
+
+- At the block timer's expiry the usual rules apply. With every sensor off (a hold sensor that has been on for `hold_max_seconds` counts as off), EC goes to `idle`, and the `on_enter_idle` turn-off (the default) switches off every controlled light that is on: the day and the night targets (`entity`/`entities` and `night_mode: entities`), not only the set of the last activation. An entity listed only in `state_entities` is never switched off.
+- With a sensor or hold sensor on, EC goes to `active`: it switches on every control entity of the current mode with that mode's `service_data` (a brightness set by hand is overwritten) and runs the timer as usual. With `sensor_type: event`, EC goes to `active` whenever a light is still on.
+- Switching every light off ends the block in `idle`, with the same turn-off as at the expiry. An override, `constrain` or a forced sensor ends it as before.
+
+Hold sensors keep any block alive (also with `block_on_external_on: false`): a hold sensor that turns on in `blocked` restarts the block timer with `block_timeout`, at most once a minute, and only within `hold_max_seconds` of the block start or the last regular-sensor onset (which re-enters `blocked`, as before). The restart neither leaves nor re-enters `blocked`, saves nothing and switches nothing; `expires_at` and `notes` show it.
+
+After a restart, a light switched on while a restored timer waits for its lights ends the wait in `blocked` too (see State Persistence).
+
+Known limits:
+
+- A light that is `unavailable` when the window ends, and was the only one on, leaves EC in `idle`; its comeback is then resynced (off when the room is quiet, adopted when a sensor is on).
+- An ON edge inside the grace period that joins an older window keeps that window's deadline, and is dropped if that deadline falls inside the grace period (seen only after a comeback resync switched the lights off). A wall-clock step back inside a grace period (the daylight-saving fall-back) makes the grace period last up to an hour longer, as before; an ON edge in that time is dropped, logged as if EC had called a service meanwhile.
+- A light returning `unavailable -> unknown -> on` counts as switched on, unlike `unavailable -> on`. So does a relay that reboots to `off` and then reports `on`.
+- An automation that EC triggered counts as external.
+- A light left on deliberately in an empty room goes off when the block ends; set `block_on_external_on: false` on such an instance.
+- A block that ends by adoption (a sensor on at the expiry) hands the lights to the current mode's set: when that timer runs out, a lamp of the other mode switched on by hand stays on (only with `night_mode: entities`).
+- A restart restarts `block_timeout` and the `hold_max_seconds` bound for hold sensors, and keeps the block only if a light reports on when the state is restored. A relay that is still `unavailable` then falls back to the normal start and its comeback resync.
+- A block ended by switching the light off still sends the usual `on_enter_idle` turn-off.
