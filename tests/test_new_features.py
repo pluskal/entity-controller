@@ -82,7 +82,7 @@ def _add_machine_transitions(machine):
     )
     machine.add_transition(
         trigger="sensor_on", source="blocked", dest="blocked",
-        conditions=["is_block_enabled"],
+        conditions=["is_block_enabled"], unless=["is_block_cap_reached"],
     )
     machine.add_transition(
         trigger="enable", source="overridden", dest="idle",
@@ -283,6 +283,8 @@ def _build_model(hass=None, entity=None, config=None):
         m.block_on_external_on = True
         m._block_ending = False
         m._block_anchor = m._block_timer_started = 0.0
+        m.block_max_seconds = None
+        m._block_started_at = None
         m.block_timeout = None
         m.grace_period = None
         m.ignore_state_changes_until = datetime.now()
@@ -1404,6 +1406,107 @@ class TestStatePersistence:
         else:
             assert model.state == "idle"
             model.turn_on_control_entities.assert_not_called()
+
+    # -- block_max_seconds across a restart (9.13.0) --------------------------
+
+    def test_block_anchor_is_saved_only_in_blocked(self):
+        """The state file gains one key, blocked_since: the first entry into
+        the block as an aware UTC time, null outside blocked. No new storage
+        version: 9.12.0 must still load the file after a rollback."""
+        from datetime import timedelta
+        from custom_components.entity_controller.const import STORAGE_VERSION
+        model = self._blocked_restore_model(lit=True)
+        result, _, _ = self._restore(model)
+        assert result is True and model.state == "blocked"
+        asyncio.run(model._async_save_state())
+        saved = model._store.async_save.call_args[0][0]
+        assert set(saved) == {"state", "saved_at", "expires_at", "blocked_since"}
+        since = datetime.fromisoformat(saved["blocked_since"])
+        assert since.utcoffset() == timedelta(0) and since == model._block_started_at
+        model.hass.states.get = MagicMock(return_value=MagicMock(state="off"))
+        self._later(model.block_timer_expires)
+        assert model.state == "idle"
+        asyncio.run(model._async_save_state())
+        saved = model._store.async_save.call_args[0][0]
+        assert saved["state"] == "idle" and saved["blocked_since"] is None
+        assert STORAGE_VERSION == 1
+
+    @pytest.mark.parametrize("case, block_timeout, low, high", [
+        ("left-600", 1800, 590, 600), ("cap-spent", 600, 179, 180), ("9.12.0-file", 600, 600, 600),
+        ("naive", 600, 600, 600), ("naive-utc", 1800, 1800, 1800), ("garbage", 600, 600, 600),
+        ("future", 600, 600, 600),
+    ])
+    def test_restored_block_keeps_counting(self, case, block_timeout, low, high):
+        """block_max_seconds (3600 here) counts from the saved first entry:
+        the restored block timer is cut to what is left, but at least one
+        delay (180 s). Without a usable anchor the count starts at the restore,
+        as for a 9.12.0 file. EC writes an aware time; a naive one is rejected,
+        not read as UTC (naive-utc: read as UTC it would arm 600 s)."""
+        from datetime import timedelta
+        from homeassistant.util import dt as dt_util
+        now = dt_util.utcnow()
+        since = {
+            "left-600": (now - timedelta(seconds=3000)).isoformat(),
+            "cap-spent": (now - timedelta(hours=5)).isoformat(),
+            "naive": str(datetime.now() - timedelta(seconds=3000)),
+            "naive-utc": (now - timedelta(seconds=3000)).replace(tzinfo=None).isoformat(),
+            "garbage": "yesterday",
+            "future": (now + timedelta(hours=1)).isoformat(),
+        }.get(case)
+        model = self._blocked_restore_model(lit=True)
+        if case != "9.12.0-file":
+            model._store.async_load.return_value["blocked_since"] = since
+        model.block_max_seconds, model.block_timeout = 3600.0, block_timeout
+        result, timer, _ = self._restore(model)
+        assert result is True and model.state == "blocked"
+        timer.assert_called_once()
+        seconds, expire_cb = timer.call_args[0]
+        assert low <= seconds <= high and expire_cb == model.block_timer_expire
+        elapsed = (dt_util.utcnow() - model._block_started_at).total_seconds()
+        if case == "left-600":
+            assert 3000 <= elapsed < 3010
+        elif case == "cap-spent":
+            assert 3420 <= elapsed < 3430  # moved: one delay is left
+        else:
+            assert 0 <= elapsed < 10
+        model.turn_off_control_entities.assert_not_called()
+        model.hass.services.async_call.assert_not_called()
+
+    def test_block_switched_on_during_the_wait_starts_a_new_anchor(self):
+        from datetime import timedelta
+        from homeassistant.util import dt as dt_util
+        model, live, _, _ = self._waiting_model(
+            150, {"light.a": "off", "light.b": "unavailable"}, sensor="off")
+        model.block_max_seconds = 3600.0
+        model._block_started_at = dt_util.utcnow() - timedelta(seconds=3000)
+        wait = model._restore_wait
+        live["light.a"] = "on"
+        self._later(model._restore_wait_event, wait, self._ev("light.a", "off", "on"))
+        timer = self._later(model._restore_wait_timeout, wait, None)
+        assert model.state == "blocked"
+        timer.assert_called_once_with(600, model.block_timer_expire)
+        assert 0 <= (dt_util.utcnow() - model._block_started_at).total_seconds() < 10
+
+    @pytest.mark.parametrize("saved_state", ["idle", "blocked", "active_timer"])
+    def test_restore_reads_a_9_12_0_file(self, saved_state):
+        """A file written by 9.12.0 (no blocked_since) restores as before."""
+        from datetime import timedelta
+        expiry = str(datetime.now() + timedelta(seconds=150)) if saved_state == "active_timer" else None
+        model = self._restore_model(
+            {"state": saved_state, "saved_at": "x", "expires_at": expiry}, {"light.a": "on", "light.b": "off"})
+        model.block_max_seconds = 3600.0
+        del model._start_timer
+        result, timer, _ = self._restore(model)
+        if saved_state == "idle":
+            assert result is False and model.state == "pending"
+            timer.assert_not_called()
+        elif saved_state == "blocked":
+            assert result is True and model.state == "blocked"
+            timer.assert_called_once_with(600, model.block_timer_expire)
+        else:
+            assert result is True and model.state == "active_timer"
+            assert 140 < timer.call_args[0][0] <= 150
+        model.turn_off_control_entities.assert_not_called()
 
     def test_on_enter_overridden_schedules_save(self):
         model = _build_model()
@@ -4380,3 +4483,283 @@ class TestBlockedHoldSensors:
             model._apply_start_time_transition()
         assert model.state == "blocked"
         assert any("no transition from state 'blocked'" in r.getMessage() for r in caplog.records)
+
+    # -- block_max_seconds (9.13.0) -------------------------------------------
+
+    def _capped(self, cap=3600.0, elapsed=0, **kwargs):
+        """blocked through a take-over with block_max_seconds set; elapsed:
+        seconds the block is made to have lasted already."""
+        from datetime import timedelta
+        model = self._model(**kwargs)
+        model.block_max_seconds = cap
+        self._take_over(model, self.L1)
+        model._block_started_at -= timedelta(seconds=elapsed)
+        return model
+
+    def _pir_edge(self, model):
+        self.live[self.PIR] = "on"
+        model.sensor_state_change(self._event(self.PIR, "off", "on"))
+
+    @staticmethod
+    def _block_age(model):
+        from homeassistant.util import dt as dt_util
+        return (dt_util.utcnow() - model._block_started_at).total_seconds()
+
+    def _clock(self):
+        """EC's wall clock (dt_util.utcnow) frozen at self.now, which _model
+        sets and a test may move: no real-time window."""
+        clock = MagicMock()
+        clock.utcnow.side_effect = lambda: self.now
+        return patch("custom_components.entity_controller.dt_util", clock)
+
+    def test_cap_unset_rearms_the_full_block_timeout(self):
+        """No cap: a re-entry arms block_timeout itself, as in 9.12.0."""
+        from unittest.mock import call
+        with self._timer() as timer:
+            model = self._blocked()
+            self._pir_edge(model)
+        assert model.state == "blocked" and model.block_max_seconds is None
+        assert timer.call_args_list == [call(1800, model.block_timer_expire)] * 2
+        assert "block_max_seconds" not in {c.args[0] for c in model.entity.set_attr.call_args_list}
+
+    @pytest.mark.parametrize("cap, low, high", [(3600.0, 1800, 1800), (900.0, 899, 900)],
+                             ids=["cap-above-block_timeout", "cap-below-block_timeout"])
+    def test_cap_first_entry(self, cap, low, high):
+        with self._timer() as timer:
+            model = self._capped(cap)
+        timer.assert_called_once()
+        assert low <= timer.call_args[0][0] <= high
+        assert 0 <= self._block_age(model) < 10
+
+    def test_cap_reentry_keeps_the_first_entry(self):
+        """A motion onset re-enters blocked: blocked_at is rewritten, the
+        first entry is kept and the new timer is cut to what the cap leaves."""
+        with self._timer() as timer:
+            model = self._capped(elapsed=3000)
+            anchor, first = model._block_started_at, model.block_timer_handle
+            model.entity.set_attr.reset_mock()
+            self._pir_edge(model)
+        assert model.state == "blocked"
+        assert model._block_started_at == anchor
+        assert timer.call_count == 2 and 590 <= timer.call_args[0][0] <= 600
+        first.cancel.assert_called_once()
+        attrs = {c.args[0]: c.args[1] for c in model.entity.set_attr.call_args_list}
+        assert isinstance(attrs["blocked_at"], datetime)
+        assert attrs["block_timeout"] == 1800
+
+    def test_cap_reentry_just_before_the_cap_runs_one_second(self):
+        with self._timer() as timer, self._clock():
+            model = self._capped(elapsed=3599.5)
+            self._pir_edge(model)
+        assert model.state == "blocked"
+        assert timer.call_count == 2 and timer.call_args[0][0] == 1.0
+
+    @pytest.mark.parametrize("kind", ["sensor", "bus-event", "hold"])
+    def test_cap_reached_edges_do_not_restart_the_timer(self, kind):
+        """Once the cap has elapsed, no edge restarts the block timer: the
+        one armed last (at most 1 s) runs out and ends the block. Edges less
+        than a second apart cannot hold the block."""
+        from datetime import timedelta
+        with self._timer() as timer, self._clock():
+            model = self._capped(elapsed=3599.5)
+            self._pir_edge(model)
+            assert timer.call_count == 2 and timer.call_args[0][0] == 1.0
+            pending = model.block_timer_handle
+            self.now += timedelta(seconds=1)  # the cap has elapsed
+            model._block_timer_started -= 61  # the hold throttle is not what stops it
+            model._schedule_save_state = MagicMock()
+            self.live[self.RADAR] = "on"
+            for _ in range(10):
+                if kind == "sensor":
+                    model.sensor_state_change(self._event(self.PIR, "off", "on"))
+                elif kind == "bus-event":
+                    model.ha_event_sensor_callback("doorbell", MagicMock())
+                else:
+                    model.hold_sensor_state_change(self._event(self.RADAR, "off", "on"))
+            assert model.state == "blocked"
+            assert timer.call_count == 2
+            assert model.block_timer_handle is pending
+            pending.cancel.assert_not_called()
+            model._schedule_save_state.assert_not_called()
+            self.live[self.PIR] = self.live[self.RADAR] = "off"
+            model.block_timer_expire()
+        assert model.state == "idle"
+        model.turn_off_control_entities.assert_called_once()
+        model.turn_on_control_entities.assert_not_called()
+
+    def test_cap_clock_step_back_cannot_pass_the_cap(self):
+        """A wall-clock step back puts the first entry in the future: the
+        elapsed time counts as 0, so a re-entry arms at most the cap itself
+        (600 s here), not the cap plus the step."""
+        from datetime import timedelta
+        with self._timer() as timer, self._clock():
+            model = self._capped(cap=600.0)
+            assert timer.call_args[0][0] == 600.0
+            self.now -= timedelta(seconds=300)  # the clock steps back
+            self._pir_edge(model)
+        assert model.state == "blocked"
+        assert timer.call_count == 2 and timer.call_args[0][0] == 600.0
+
+    def test_production_table_matches_the_test_copy(self):
+        """The suite drives a copy of the transition table
+        (_add_machine_transitions). This builds the table async_setup builds
+        and compares the two, so the guard on the blocked re-entry (unless
+        is_block_cap_reached) is pinned in the production table."""
+        import custom_components.entity_controller as ec
+        from transitions.extensions import HierarchicalMachine
+        from custom_components.entity_controller.const import STATES
+
+        def table(machine):
+            rows = set()
+            for name, ev in machine.events.items():
+                if name.startswith("to_"):
+                    continue
+                for src, transitions in ev.transitions.items():
+                    for t in transitions:
+                        conds = tuple(sorted((str(c.func), bool(c.target)) for c in t.conditions))
+                        rows.add((name, src, t.dest, conds, tuple(str(a) for a in t.after)))
+            return rows
+
+        built = {}
+
+        def factory(*args, **kwargs):
+            built["machine"] = HierarchicalMachine(*args, **kwargs)
+            return built["machine"]
+
+        component = MagicMock()
+        component.async_add_entities = AsyncMock()
+        with patch("custom_components.entity_controller.Machine", side_effect=factory), patch(
+                "custom_components.entity_controller.EntityComponent", return_value=component), patch(
+                "custom_components.entity_controller.async_setup_entity_services"):
+            assert asyncio.run(ec.async_setup(MagicMock(), {ec.DOMAIN: []})) is True
+        test_copy = HierarchicalMachine(states=STATES, initial="pending", finalize_event="finalize")
+        _add_machine_transitions(test_copy)
+        production, copied = table(built["machine"]), table(test_copy)
+        assert production - copied == set() and copied - production == set()
+        assert ("sensor_on", "blocked", "blocked",
+                (("is_block_cap_reached", False), ("is_block_enabled", True)), ()) in production
+
+    def test_cap_unset_keeps_every_reentry(self):
+        """No cap: ten onsets, ten new block timers, as in 9.12.0."""
+        from unittest.mock import call
+        with self._timer() as timer:
+            model = self._blocked()
+            for _ in range(10):
+                self._pir_edge(model)
+        assert model.state == "blocked"
+        assert timer.call_args_list == [call(1800, model.block_timer_expire)] * 11
+
+    @pytest.mark.parametrize("holder", ["quiet", "sensor"])
+    def test_cap_expiry_uses_the_block_expiry_rules(self, holder):
+        """At the cap the usual expiry rules run: off when the room is quiet,
+        adopted when a sensor is on."""
+        with self._timer() as timer:
+            model = self._capped(elapsed=3000)
+            self._pir_edge(model)
+            assert 590 <= timer.call_args[0][0] <= 600
+            if holder == "quiet":
+                self.live[self.PIR] = "off"
+            model.block_timer_expire()
+        if holder == "quiet":
+            assert model.state == "idle"
+            model.turn_off_control_entities.assert_called_once()
+            model.turn_on_control_entities.assert_not_called()
+        else:
+            assert model.state == "active_timer"
+            model.turn_on_control_entities.assert_called_once()
+            model.turn_off_control_entities.assert_not_called()
+
+    def test_cap_clamps_a_hold_restart(self):
+        with self._timer() as timer:
+            model = self._capped(elapsed=3000)
+            anchor = model._block_started_at
+            model._block_timer_started -= 61
+            self.live[self.RADAR] = "on"
+            model.hold_sensor_state_change(self._event(self.RADAR, "off", "on"))
+        assert model.state == "blocked" and model._block_started_at == anchor
+        assert timer.call_count == 2 and 590 <= timer.call_args[0][0] <= 600
+
+    @pytest.mark.parametrize(
+        "way", ["idle-take-over", "control-from-active_timer", "constrained", "after-adoption", "after-override"])
+    def test_cap_new_block_new_anchor(self, way):
+        """Only a re-entry keeps the first entry: every block entered from
+        another state counts from its own start."""
+        with self._timer() as timer, patch(self.LATER):
+            model = self._capped(elapsed=3000)
+            assert self._block_age(model) >= 3000
+            if way == "idle-take-over":
+                model.block_timer_expire()
+                assert model.state == "idle"
+                self.live[self.L1] = "off"
+                self._take_over(model, self.L1)
+            elif way == "constrained":
+                model.constrain()
+                model.blocked()
+            elif way == "after-override":
+                model.override()
+                model.enable()
+                assert model.state == "idle"
+                model.sensor_on()
+            else:
+                self.live[self.PIR] = "on"
+                model.block_timer_expire()
+                assert model.state == "active_timer"
+                if way == "control-from-active_timer":
+                    model.control()
+                else:
+                    model.block_enable()
+        assert model.state == "blocked"
+        assert 0 <= self._block_age(model) < 10
+        assert timer.call_args[0][0] == 1800
+
+    def test_cap_without_block_timeout_arms_the_cap(self):
+        """block_timeout unset: the cap alone times the block; a hold edge
+        still restarts nothing."""
+        with self._timer() as timer, patch(self.LATER) as later:
+            model = self._model()
+            model.block_timeout, model.block_max_seconds = None, 600.0
+            self.live[self.L1] = "on"
+            model.state_entity_state_change(self._event(self.L1, "off", "on"))
+            later.call_args[0][2](None)
+            assert model.state == "blocked"
+            timer.assert_called_once()
+            assert 599 <= timer.call_args[0][0] <= 600
+            model._block_timer_started -= 61
+            self.live[self.RADAR] = "on"
+            model.hold_sensor_state_change(self._event(self.RADAR, "off", "on"))
+            timer.assert_called_once()
+            model.block_timer_expire()
+        assert model.state == "active_timer"  # the radar holds at the expiry: adopted
+
+    @pytest.mark.parametrize("cfg, expected, errors", [
+        ({}, None, 0),
+        ({"block_max_seconds": None}, None, 0),
+        ({"block_max_seconds": 3600}, 3600.0, 0),
+        ({"block_max_seconds": "600"}, 600.0, 0),
+        ({"block_max_seconds": 0}, None, 1),
+        ({"block_max_seconds": -5}, None, 1),
+        ({"block_max_seconds": True}, None, 1),
+        ({"block_max_seconds": "abc"}, None, 1),
+        ({"block_max_seconds": float("nan")}, None, 1),
+        ({"block_max_seconds": 10 ** 9}, None, 1),
+    ], ids=["unset", "null", "number", "numeric-str", "zero", "negative", "bool", "text", "nan", "too-big"])
+    def test_block_max_seconds_parsing(self, caplog, cfg, expected, errors):
+        """1-604800 s or null; anything else logs an error and sets no cap.
+        The attribute is shown only with a cap and kept on an idle entry."""
+        from custom_components.entity_controller import EntityController
+        caplog.set_level(logging.INFO)
+        entity = EntityController.__new__(EntityController)
+        entity.attributes, entity.may_update = {}, False
+        entity.async_set_context = MagicMock()
+        model = _build_model(entity=entity)
+        model.block_max_seconds = 42.0
+        model.config_other(cfg)
+        assert model.block_max_seconds == expected
+        assert sum(r.levelno == logging.ERROR for r in caplog.records) == errors
+        model.update(blocked_at=datetime.now())
+        model.constrain()
+        model.enable()  # constrained -> idle: on_enter_idle -> reset_state
+        assert model.state == "idle"
+        assert entity.attributes.get("block_max_seconds") == expected
+        assert ("block_max_seconds" in entity.attributes) is (expected is not None)
+        assert "blocked_at" not in entity.attributes

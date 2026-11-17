@@ -98,6 +98,7 @@ from .const import (
     CONF_BLOCK_TIMEOUT,
     CONF_DISABLE_BLOCK,
     CONF_BLOCK_ON_EXTERNAL_ON,
+    CONF_BLOCK_MAX_SECONDS,
     CONF_SENSOR_TYPE_DURATION,
     CONF_SENSOR_TYPE,
     CONF_SENSOR_RESETS_TIMER,
@@ -205,6 +206,7 @@ ENTITY_SCHEMA = vol.Schema(
         vol.Optional(CONF_DISABLE_BLOCK, default=False): cv.boolean,
         # documentation only; runtime accepts a real bool (config_other)
         vol.Optional(CONF_BLOCK_ON_EXTERNAL_ON, default=True): cv.boolean,
+        vol.Optional(CONF_BLOCK_MAX_SECONDS, default=None): vol.Any(None, vol.Coerce(float)),
         vol.Optional(CONF_IGNORE_STATE_CHANGES_UNTIL, default=None): vol.Any(None, cv.positive_int),
         vol.Optional(CONF_NIGHT_MODE, default=None): MODE_SCHEMA,
         vol.Optional(CONF_STATE_ATTRIBUTES_IGNORE, default=[]): cv.ensure_list,
@@ -321,7 +323,8 @@ async def async_setup(hass, config):
     # Blocked
     machine.add_transition(trigger="enable", source="blocked", dest="idle", conditions=["is_state_entities_off"])
     machine.add_transition(
-        trigger="sensor_on", source="blocked", dest="blocked", conditions=["is_block_enabled"]
+        trigger="sensor_on", source="blocked", dest="blocked",
+        conditions=["is_block_enabled"], unless=["is_block_cap_reached"]
     )  # re-entering self-transition (on_enter callback executed.)
 
     # Overridden
@@ -589,6 +592,7 @@ class EntityController(entity.Entity):
             "lux_threshold",
             "lux_bright_states",
             "block_on_external_on",
+            "block_max_seconds",
         ]
         for k, v in self.attributes.items():
             if k in PERSISTED_STATE_ATTRIBUTES:
@@ -702,6 +706,8 @@ class Model:
         # of the block start / last regular-sensor entry and of the block timer
         self._block_ending = False
         self._block_anchor = self._block_timer_started = 0.0
+        self.block_max_seconds = None
+        self._block_started_at = None  # UTC, first entry into the current block
         self.night_mode_entity = None
         self.night_mode_entity_states = []
         self.nightControlEntities = []
@@ -945,8 +951,9 @@ class Model:
         """A hold sensor keeps a block alive (2026-11-10): the block timer
         restarts in place, at most once per HOLD_REARM_THROTTLE seconds and
         within hold_max_seconds of the block start or the last regular-sensor
-        edge; never a re-entry of blocked."""
-        if not self.block_timeout:
+        edge; never a re-entry of blocked. Not once block_max_seconds has
+        elapsed."""
+        if not self.block_timeout or self.is_block_cap_reached():
             return
         now, cap = self.hass.loop.time(), getattr(self, "hold_max_seconds", None)
         if cap and now - self._block_anchor >= cap:
@@ -1543,6 +1550,12 @@ class Model:
     def is_block_enabled(self):
         return self.disable_block is False
 
+    def is_block_cap_reached(self):
+        """block_max_seconds has elapsed: nothing restarts the block timer any
+        more, the pending one ends the block."""
+        cap, since = self.block_max_seconds, self._block_started_at
+        return bool(cap and since) and (dt_util.utcnow() - since).total_seconds() >= cap
+
     def is_lux_constraint_satisfied(self):
         """Whether the illuminance constraint allows turning the lights on.
 
@@ -1739,28 +1752,42 @@ class Model:
     def on_exit_active_stay_on(self):
         self._debounce_window = None
 
-    def on_enter_blocked(self):
+    def on_enter_blocked(self, since=None):
+        """since: saved first entry of a restored block (restore_blocked)."""
         self.log.debug("Entering blocked")
+        # A re-entry (sensor_on in blocked) keeps the first entry.
+        if since is not None or not self._block_ending or self._block_started_at is None:
+            self._block_started_at = since or dt_util.utcnow()
         self.update(blocked_at=datetime.now())
         self.update(blocked_by=self._state_entity_state())
 
         self.do_transition_behaviour(CONF_ON_ENTER_BLOCKED)
         self._block_anchor = self.hass.loop.time()
-        if self.block_timeout:
+        if self.block_timeout or self.block_max_seconds:
             self._start_block_timer()
         self._schedule_save_state()
+
+    def _block_seconds(self):
+        """block_timeout, cut to what block_max_seconds leaves (at least 1 s)."""
+        seconds, cap = self.block_timeout, self.block_max_seconds
+        if cap:
+            elapsed = (dt_util.utcnow() - (self._block_started_at or dt_util.utcnow())).total_seconds()
+            left = max(cap - max(elapsed, 0), 1.0)
+            seconds = left if not seconds else min(seconds, left)
+        return seconds
 
     def _start_block_timer(self):
         # Locals only: the expiring timer's worker may clear the handle
         # (on_exit_blocked) at any point in between.
-        old, new = self.block_timer_handle, Timer(self.block_timeout, self.block_timer_expire)
+        seconds = self._block_seconds()
+        old, new = self.block_timer_handle, Timer(seconds, self.block_timer_expire)
         if old is not None:
             old.cancel()
         self.block_timer_handle = new
         self._block_timer_started = self.hass.loop.time()
         new.start()
         self.update(block_timeout=self.block_timeout,
-                    expires_at=datetime.now() + timedelta(seconds=self.block_timeout))
+                    expires_at=datetime.now() + timedelta(seconds=seconds))
 
     def on_exit_blocked(self):
         self.log.debug("Exiting blocked")
@@ -2193,6 +2220,19 @@ class Model:
         self.update(block_on_external_on=external_on)
         if not external_on:
             self.log.info("block_on_external_on is false: a light switched on outside EC while idle is left as it is")
+        raw, cap = config.get(CONF_BLOCK_MAX_SECONDS), None
+        if raw is not None:
+            try:
+                if isinstance(raw, bool):
+                    raise ValueError(raw)
+                cap = float(raw)
+                if not 1 <= cap <= 604800:
+                    raise ValueError(raw)
+            except (TypeError, ValueError, OverflowError):
+                self.log.error("block_max_seconds must be 1-604800 seconds or null, got %r; no cap", raw)
+                cap = None
+        self.block_max_seconds = cap
+        self.update(block_max_seconds=cap)  # update() skips None: no attribute without a cap
         self.image_prefix = config.get("image_prefix", "/fsm_diagram_")
         self.image_path = config.get("image_path", "/conf/temp")
         self.backoff = config.get("backoff", False)
@@ -2255,6 +2295,10 @@ class Model:
             # restarts the light stayed on 21 times, with a 20-40 min tail
             # after the last motion).
             "expires_at": str(expiry) if expiry else None,
+            # First entry into the block (UTC), so block_max_seconds keeps
+            # counting across a restart.
+            "blocked_since": self._block_started_at.isoformat()
+                             if state == "blocked" and self._block_started_at else None,
         }
         self.log.debug("_async_save_state :: Saving state: %s", data)
         await self._store.async_save(data)
@@ -2309,7 +2353,7 @@ class Model:
                 return False  # the caller enters overridden, as on a normal start
             if self.is_state_entities_on() and self.is_block_enabled():
                 self.set_context(None)
-                self.restore_blocked()
+                self.restore_blocked(since=self._restored_block_start(data.get("blocked_since")))
                 return True
             return False
 
@@ -2328,6 +2372,22 @@ class Model:
         # For all other states (idle, constrained, etc.) let the normal startup
         # evaluation run.
         return False
+
+    def _restored_block_start(self, raw):
+        """Saved first entry of a restored block, moved so that one delay is
+        left; None (no cap, a 9.12.0 file, unreadable): the block starts now."""
+        cap = self.block_max_seconds
+        if not cap or not raw:
+            return None
+        try:
+            since = datetime.fromisoformat(str(raw))
+        except ValueError:
+            return None
+        if since.tzinfo is None:
+            return None
+        now = dt_util.utcnow()
+        floor = now - timedelta(seconds=max(cap - self._restore_delays()[0], 0))
+        return min(max(since, floor), now)
 
     def _restore_timer(self, expiry, settled=False):
         """Settle a saved active_timer from the live states (EC in pending).

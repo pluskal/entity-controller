@@ -113,6 +113,9 @@ CONF_DISABLE_BLOCK = "disable_block"
 # A state entity switched on outside EC while EC is idle puts EC in blocked
 # (2026-11-10); false leaves such a light alone.
 CONF_BLOCK_ON_EXTERNAL_ON = "block_on_external_on"
+# Longest a block may last, counted from its first entry (2026-11-17: motion
+# onsets kept ec_108f blocked for 52 min); null = no cap.
+CONF_BLOCK_MAX_SECONDS = "block_max_seconds"
 CONF_SENSOR_TYPE_DURATION = "sensor_type_duration"
 CONF_SENSOR_TYPE = "sensor_type"
 CONF_SENSOR_RESETS_TIMER = "sensor_resets_timer"
