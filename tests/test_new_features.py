@@ -2570,6 +2570,37 @@ class TestLinkOutage:
             later.call_args[0][2](None)
         model.control.assert_called_once()
 
+    def test_light_unavailable_at_turn_off_is_switched_off_at_its_return(self):
+        """ec_108f shape (2026-11-17): light.108_f is unavailable when the
+        timer runs out, so that turn-off never reaches it. When it returns on
+        while EC is idle and the sensors are off, a second turn-off pass goes
+        out, inside the grace period of the first."""
+        f, i, proxy = "light.108_f", "light.108_i", "input_boolean.108_led_proxy_ec"
+        model = _build_model()
+        model.controlEntities = [f, i, proxy]
+        model.stateEntities = [f, i, proxy]
+        model.grace_period = 30
+        live = {f: "off", i: "off", proxy: "off", "binary_sensor.motion": "off"}
+        model.hass.states.get = MagicMock(
+            side_effect=lambda e: MagicMock(state=live[e], attributes={}))
+        targets = TestBlockedHoldSensors._service_targets
+        with patch(TestStatePersistence.NO_SAVE, side_effect=lambda coro, loop: coro.close()):
+            model.sensor_on()
+            assert model.state == "active_timer"
+            assert targets(model, "turn_on") == [f, i, proxy]
+            live.update({f: "unavailable", i: "on", proxy: "on"})
+            model.hass.services.async_call.reset_mock()
+            model.timer_expires()
+            assert model.state == "idle"
+            assert targets(model, "turn_off") == [f, i, proxy]  # 108_f: skipped by Home Assistant
+            live.update({f: "on", i: "off", proxy: "off"})
+            model.hass.services.async_call.reset_mock()
+            assert model.is_within_grace_period()
+            model.state_entity_state_change(self._event("unavailable", "on", f))
+        assert model.state == "idle"
+        assert targets(model, "turn_off") == [f, i, proxy]
+        assert targets(model, "turn_on") == []
+
 
 # ---------------------------------------------------------------------------
 # 2026-10-30 – short state bounce of a controlled entity (state_change_debounce)
