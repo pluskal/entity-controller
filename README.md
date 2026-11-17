@@ -194,7 +194,7 @@ entity_controller:
 
 **Problem:** Some devices report a short `on -> off -> on` bounce (a relay re-reporting, a Wi-Fi blip) with a context that is not EC's own. EC read the first edge as manual control. In `active_timer` it went to `blocked`, or to `idle` (switching the lights off) if nothing else was on, or restarted the timer under `disable_block`. In `blocked`/`active_stay_on` the bounce of the last lit entity sent EC to `idle`, switching the light off.
 
-**Solution:** After an external change of a state entity in `active_timer`, `blocked` or `active_stay_on`, and in `idle` for a light switched on (see Block on External ON), EC waits `state_change_debounce` seconds. It then compares every entity that changed with its state before the first change. If all of them are back, the change is ignored; otherwise EC reacts once, as before. The window starts at the first change, and later changes do not extend it.
+**Solution:** After an external change of a state entity in `active_timer`, `blocked` or `active_stay_on`, and in `idle` for a light switched on (see Block on External ON), EC waits `state_change_debounce` seconds. It then compares every entity that changed with its state before the first change. If all of them are back, the change is ignored; otherwise EC reacts once, as before (except for a partial off while the timer runs, see below). The window starts at the first change, and later changes do not extend it.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -212,6 +212,17 @@ Known limits (set `0` on an instance where one of them matters; `0` also removes
 - An entity may return from `unavailable` inside the window while the timer runs. EC's resync then turns the lights back on, and the change is usually lost.
 - A Home Assistant restart inside the window drops the pending check.
 - After a real external off, a motion onset or `entity_controller.activate` that arrives inside the window only restarts the timer; at the deadline EC goes to `idle` and the light stays off until the next sensor onset (before 9.11.3 it was re-lit at once).
+
+## Partial OFF While the Timer Runs
+
+**Problem:** With several controlled lights, one of them going off for good while the timer ran (a relay dropping out, a wall switch) put EC in `blocked`, although the lights that were still on were the ones EC had switched on. Every motion onset then renewed the block and the other lights stayed on (2026-11-17 19:56:53: `light.108_i` reported off 67 s before the timer was due; ec_108f went `blocked` and three motion onsets kept the pergola lit until it was switched off by hand 52 minutes later).
+
+**Solution (9.13.0):** In `active_timer`, a state entity that goes from on to not on with a context that is not EC's own, and is still not on after `state_change_debounce`, no longer blocks while another light is on. EC stays in `active_timer` and touches neither the timer nor its expiry; when the timer runs out, EC switches the other lights off and goes to `idle`. EC logs `<light> switched off outside EC while another light is on; not blocked` (INFO) and names the light in `notes`. There is no option: the rule applies to every instance.
+
+- The timer is kept only when every change that persisted is such an off, and every light still on is one the timer will switch off (the control entities of the last activation). A lit light outside that set (the other mode's lamp with `night_mode: entities`, an entity listed only in `state_entities`) still puts EC in `blocked`, as before 9.13.0.
+- Any other change that persists blocks as before: a light switched on, a significant attribute change, or one of those in the same window as an off. A light that went off and later goes `off -> on` blocks too.
+- When no light is on any more, EC goes to `idle`, as before. With `disable_block: true` a partial off restarts the timer, as before. With `state_change_debounce` `0`/`null` the rule is applied to each change at once.
+- A motion onset before the timer runs out only restarts the timer; the light that was switched off stays off until the next activation. One exception: while the timer runs, any controlled light that returns `off` from `unavailable` makes EC switch all of them on again (the comeback resync, unchanged), including a lamp switched off by hand. That ends when the timer runs out.
 
 ## Block on External ON (`block_on_external_on`)
 

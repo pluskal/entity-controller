@@ -1122,6 +1122,9 @@ class Model:
             self.log.debug("state_entity_state_change :: cannot compare the two states, handling the change: %s", a)
         if self._debounce_state_change(entity, old, new, attr_only):
             return
+        if self.is_active_timer() and self._partial_off([(old, new)]):
+            self._keep_timer([entity])
+            return
         self.set_context(new.context)
         if self.is_idle():
             # acts only with the debounce off; with it on, an ON edge went into the window
@@ -1134,6 +1137,31 @@ class Model:
 
         if self.is_blocked() or self.is_active_stay_on(): # if statement required to avoid MachineErrors, cleaner than adding transitions to all possible states.
             self.enable()
+
+    def _partial_off(self, changes):
+        """changes: (state before, state now) pairs. True when each is a state
+        entity that was on and is not on any more, and every state entity still
+        on is one the timer's turn-off will switch (2026-11-17: light.108_i
+        reported off mid-timer and ec_108f stayed blocked for 52 min)."""
+        if not changes or not self.is_block_enabled():
+            return False
+        for old, cur in changes:
+            if old is None or cur is None or not self.matches(old.state, self.STATE_ON_STATE) \
+                    or self.matches(cur.state, self.STATE_ON_STATE):
+                return False
+        targets = self.activeControlEntities or self.controlEntities
+        still_on = [e for e in self.stateEntities if self._is_state_on(e)]
+        return bool(still_on) and all(e in targets for e in still_on)
+
+    def _is_state_on(self, entity):
+        s = self.hass.states.get(entity)
+        return s is not None and self.matches(s.state, self.STATE_ON_STATE)
+
+    def _keep_timer(self, entities):
+        names = ", ".join(entities)
+        # no timer claim: with a sensor holding the light none is running
+        self.log.info("%s switched off outside EC while another light is on; not blocked", names)
+        self.update(notes="%s switched off outside EC while another light is on; not blocked" % names)
 
     def _significant_attributes(self, state):
         return {
@@ -1200,6 +1228,10 @@ class Model:
         if not changed:
             if back:
                 log("_state_debounce_fire :: %s is back to its previous state - ignoring the bounce (EC state: %s)", ", ".join(back), self.state)
+            return
+        if window.state == "active_timer" and self._partial_off(
+                [(window.snapshot[e][0], self._debounce_current(e, window.snapshot[e][2])) for e in changed]):
+            self._keep_timer(changed)
             return
         if window.state != "idle":
             self.log.info("_state_debounce_fire :: %s changed for good - handling it (EC state: %s)", ", ".join(changed), self.state)

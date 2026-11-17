@@ -2671,25 +2671,42 @@ class TestStateChangeDebounce:
         model._start_timer.assert_not_called()
         model._cancel_timer.assert_not_called()
 
-    def test_incident_without_debounce_blocks(self):
-        """state_change_debounce 0 is the 9.11.2 path: blocked on the first edge."""
+    def test_incident_without_debounce_keeps_timer(self):
+        """state_change_debounce 0 judges the first edge at once: a partial
+        off keeps the timer (9.13.0; blocked before)."""
         model = self._model(debounce=0)
         self._live(model, "on", {self.E108I: "off"})
         with patch(self.LATER) as later:
             model.state_entity_state_change(self._event(self.E108I, "on", "off"))
-        assert model.state == "blocked"
+        assert model.state == "active_timer"
         later.assert_not_called()
+        assert model._debounce_window is None
+        model.control.assert_not_called()
+        model.hass.services.async_call.assert_not_called()
 
     # -- persisted changes ----------------------------------------------------
 
-    def test_persisted_single_off_blocks(self):
+    def test_persisted_single_off_keeps_timer(self):
+        """One light off for good while the others stay on: the timer keeps
+        running and its run-out switches the rest off (9.13.0; blocked before)."""
         model = self._model()
+        context = model.context
+        model.entity.set_attr.reset_mock()
         with patch(self.LATER) as later:
             model.state_entity_state_change(self._event(self.E108I, "on", "off"))
             self._live(model, "on", {self.E108I: "off"})
             self._fire(later)
-        assert model.state == "blocked"
-        model.control.assert_called_once()
+        assert model.state == "active_timer"
+        model.control.assert_not_called()
+        model._start_timer.assert_not_called()
+        model._cancel_timer.assert_not_called()
+        assert model.context is context
+        assert self._attrs(model)["notes"] == "light.108_i switched off outside EC while another light is on; not blocked"
+        model.hass.services.async_call.assert_not_called()
+        model.turn_off_control_entities.assert_not_called()
+        model.timer_expires()
+        assert model.state == "idle"
+        model.turn_off_control_entities.assert_called_once()
 
     def test_persisted_single_off_with_disable_block_resets_timer(self):
         model = self._model()
@@ -2711,6 +2728,221 @@ class TestStateChangeDebounce:
         assert model.state == "idle"
         model.turn_off_control_entities.assert_called_once()
 
+    # -- partial off while the timer runs (9.13.0) ----------------------------
+
+    W, BED, READING = "light.205_wardrobe", "light.205_bed", "light.205_reading"
+    PORTAL = "binary_sensor.108_motion_hs_portal_occupancy"
+
+    @pytest.mark.parametrize("other", ["attribute", "off-then-on", "no-old-state"])
+    def test_partial_off_with_another_change_blocks(self, other):
+        """Only a lasting on -> off is tolerated: mixed with another kind of
+        change, or followed by that light coming back on, EC blocks as before."""
+        model = self._model()
+        with patch(self.LATER) as later:
+            model.state_entity_state_change(self._event(self.E108I, "on", "off"))
+            if other == "attribute":
+                model.state_entity_state_change(self._event(
+                    self.E108F, "on", "on", {"brightness": 100}, {"brightness": 50}))
+                self._live(model, "on", {self.E108I: "off", self.E108F: self._st("on", brightness=50)})
+            elif other == "no-old-state":
+                model.state_entity_state_change(self._event(self.E108F, None, "on"))
+                self._live(model, "on", {self.E108I: "off"})
+            else:
+                self._live(model, "on", {self.E108I: "off"})
+                self._fire(later, 0)
+                assert model.state == "active_timer"
+                model.state_entity_state_change(self._event(self.E108I, "off", "on"))
+                assert later.call_count == 2
+                self._live(model, "on")
+            self._fire(later, -1)
+        assert model.state == "blocked"
+        model.control.assert_called_once()
+
+    @pytest.mark.parametrize("debounce", [3.0, 0], ids=["debounce", "no-debounce"])
+    @pytest.mark.parametrize("case", ["other-mode-lamp-lit", "state-only-entity-lit", "control-set-lit"])
+    def test_partial_off_needs_every_lit_entity_in_the_control_set(self, case, debounce):
+        """The timer is kept only when its run-out switches off everything
+        that is still on. ec_205: wardrobe by day, bed lamp at night, both
+        state entities, the day set active. A lit lamp outside the active
+        set, or an entity listed only in state_entities, blocks as in 9.12.0."""
+        model = self._model(debounce=debounce)
+        model.controlEntities, model.nightControlEntities = [self.W], [self.BED]
+        model.activeControlEntities = [self.W]
+        model.stateEntities = [self.W, self.BED] + ([self.READING] if case == "state-only-entity-lit" else [])
+        del model.turn_off_control_entities
+        off = self.W if case == "other-mode-lamp-lit" else self.BED
+        with patch(self.LATER) as later, patch(self.NO_SAVE, side_effect=lambda coro, loop: coro.close()):
+            self._set_live(model, {**dict.fromkeys(model.stateEntities, "on"), off: "off"})
+            model.state_entity_state_change(self._event(off, "on", "off"))
+            if debounce:
+                self._fire(later)
+            else:
+                later.assert_not_called()
+            if case == "control-set-lit":
+                assert model.state == "active_timer"
+                model.control.assert_not_called()
+                model.hass.services.async_call.assert_not_called()
+                model.timer_expires()
+                assert model.state == "idle"
+                assert TestBlockedHoldSensors._service_targets(model, "turn_off") == [self.W]
+            else:
+                assert model.state == "blocked"
+                model.control.assert_called_once()
+                model.hass.services.async_call.assert_not_called()
+
+    @pytest.mark.parametrize("debounce", [3.0, 0], ids=["debounce", "no-debounce"])
+    @pytest.mark.parametrize("case", ["day-lamp-lit", "night-set-lit"])
+    def test_partial_off_with_the_night_set_active(self, case, debounce):
+        """The control set is the one of the last activation, not the day
+        targets: ec_205 at night, the bed lamp is the active set. The bed lamp
+        off with the wardrobe lit by hand blocks; the wardrobe off with the bed
+        lamp still on keeps the timer, and its run-out switches the bed lamp off."""
+        model = self._model(debounce=debounce)
+        model.controlEntities, model.nightControlEntities = [self.W], [self.BED]
+        model.activeControlEntities = [self.BED]
+        model.stateEntities = [self.W, self.BED]
+        del model.turn_off_control_entities
+        off, lit = (self.BED, self.W) if case == "day-lamp-lit" else (self.W, self.BED)
+        with patch(self.LATER) as later, patch(self.NO_SAVE, side_effect=lambda coro, loop: coro.close()):
+            self._set_live(model, {lit: "on", off: "off"})
+            model.state_entity_state_change(self._event(off, "on", "off"))
+            if debounce:
+                self._fire(later)
+            else:
+                later.assert_not_called()
+            model.hass.services.async_call.assert_not_called()
+            if case == "night-set-lit":
+                assert model.state == "active_timer"
+                model.control.assert_not_called()
+                model.timer_expires()
+                assert model.state == "idle"
+                assert TestBlockedHoldSensors._service_targets(model, "turn_off") == [self.BED]
+            else:
+                assert model.state == "blocked"
+                model.control.assert_called_once()
+
+    def test_incident_2026_11_17_replay(self):
+        """ec_108f, 2026-11-17 19:52:38-20:21:21: light.108_i reported off 67 s
+        before the timer was due. 9.12.0 went blocked and three motion onsets
+        kept the lights on until 20:49; now they go off when the timer runs
+        out (19:58:01) and every later onset is a normal cycle."""
+        model = self._model("idle")
+        model.sensor_type = "duration"
+        model.config["sensor_resets_timer"] = True
+        model.sensorEntities = [self.PORTAL]
+        model.block_timeout = 1800
+        model.blocked = MagicMock(side_effect=model.blocked)
+        live = dict.fromkeys(self.ENTITIES + (self.PORTAL,), "off")
+        model.hass.states.get = MagicMock(side_effect=lambda e: self._st(live[e]))
+        seen = []
+
+        def portal(new):
+            old, live[self.PORTAL] = live[self.PORTAL], new
+            model.sensor_state_change(self._event(self.PORTAL, old, new))
+            seen.append(model.state)
+
+        def light_108i(new):
+            old, live[self.E108I] = live[self.E108I], new
+            model.state_entity_state_change(self._event(self.E108I, old, new))
+            seen.append(model.state)
+
+        def expire():
+            model.timer_expire()
+            seen.append(model.state)
+            live.update(dict.fromkeys(self.ENTITIES, "off"))
+
+        with patch(self.LATER) as later, patch(self.TIMER) as timer:
+            portal("on")  # 19:52:38
+            assert model.state == "active_timer"
+            model.turn_on_control_entities.assert_called_once()
+            live.update(dict.fromkeys(self.ENTITIES, "on"))
+            portal("off")  # 19:54:08
+            portal("on")  # 19:54:31
+            portal("off")  # 19:56:01, the timer is due 19:58:01
+            assert model._start_timer.call_count == 4
+            light_108i("off")  # 19:56:53
+            later.assert_called_once()
+            self._fire(later)  # 19:56:56, blocked in 9.12.0
+            assert model.state == "active_timer"
+            assert model._start_timer.call_count == 4
+            model.turn_off_control_entities.assert_not_called()
+            expire()  # 19:58:01
+            assert model.state == "idle"
+            model.turn_off_control_entities.assert_called_once()
+            assert model._start_timer.call_count == 4
+            for _ in range(9):  # 19:59:08-20:48:34
+                light_108i("unavailable")
+                light_108i("off")
+            for n in (2, 3, 4):  # 20:10:07, 20:14:04, 20:19:50
+                portal("on")
+                assert model.state == "active_timer"
+                assert model.turn_on_control_entities.call_count == n
+                live.update(dict.fromkeys(self.ENTITIES, "on"))
+                portal("off")
+                expire()
+                assert model.state == "idle"
+                assert model.turn_off_control_entities.call_count == n
+            later.assert_called_once()
+        assert "blocked" not in seen
+        model.blocked.assert_not_called()
+        model.control.assert_not_called()
+        timer.assert_not_called()
+        model.hass.services.async_call.assert_not_called()
+
+    def test_partial_off_then_link_flaps_never_blocks(self):
+        """A lasting off, then the same light flapping unavailable <-> off
+        (2026-11-17 order): no block, each comeback as off is re-lit, and the
+        run-out sends a turn-off to every target, also the unavailable one."""
+        model = self._model()
+        del model.turn_off_control_entities
+        with patch(self.LATER) as later, patch(self.NO_SAVE, side_effect=lambda coro, loop: coro.close()):
+            self._live(model, "on", {self.E108I: "off"})
+            model.state_entity_state_change(self._event(self.E108I, "on", "off"))
+            self._fire(later)
+            assert model.state == "active_timer"
+            for n in (1, 2):
+                self._live(model, "on", {self.E108I: "unavailable"})
+                model.state_entity_state_change(self._event(self.E108I, "off", "unavailable"))
+                self._live(model, "on", {self.E108I: "off"})
+                model.state_entity_state_change(self._event(self.E108I, "unavailable", "off"))
+                assert model.state == "active_timer"
+                assert model.turn_on_control_entities.call_count == n
+            self._live(model, "on", {self.E108I: "unavailable"})
+            model.state_entity_state_change(self._event(self.E108I, "off", "unavailable"))
+            later.assert_called_once()
+            model.control.assert_not_called()
+            model.hass.services.async_call.assert_not_called()
+            model.timer_expires()
+        assert model.state == "idle"
+        assert TestBlockedHoldSensors._service_targets(model, "turn_off") == list(self.ENTITIES)
+        assert TestBlockedHoldSensors._service_targets(model, "turn_on") == []
+
+    def test_real_lights_off_by_hand_with_the_proxy_on(self):
+        """2026-11-13: both real lights off by hand (108_i unavailable, 108_f
+        switched off) while the proxy stays on. No block; motion before the
+        run-out only restarts the timer; the run-out switches the proxy off
+        and the next onset lights everything again."""
+        model = self._model()
+        del model.turn_off_control_entities
+        with patch(self.LATER) as later, patch(self.NO_SAVE, side_effect=lambda coro, loop: coro.close()):
+            self._live(model, "on", {self.E108I: "unavailable", self.E108F: "off"})
+            model.state_entity_state_change(self._event(self.E108F, "on", "off", ctx="user-ctx"))
+            self._fire(later)
+            assert model.state == "active_timer"
+            model.control.assert_not_called()
+            model.sensor_on()
+            assert model.state == "active_timer"
+            model._start_timer.assert_called_once()
+            model.turn_on_control_entities.assert_not_called()
+            model.hass.services.async_call.assert_not_called()
+            model.timer_expires()
+            assert model.state == "idle"
+            assert self.PROXY in TestBlockedHoldSensors._service_targets(model, "turn_off")
+            self._live(model, "off", {self.E108I: "unavailable"})
+            model.sensor_on()
+        assert model.state == "active_timer"
+        model.turn_on_control_entities.assert_called_once()
+
     # -- one window per burst -------------------------------------------------
 
     def test_burst_arms_one_window_with_fixed_deadline(self):
@@ -2727,18 +2959,19 @@ class TestStateChangeDebounce:
             later.assert_called_once()
             self._live(model, "on", {self.E108F: "off"})
             self._fire(later)
-        assert model.state == "blocked"
-        model.control.assert_called_once()
+        assert model.state == "active_timer"
+        model.control.assert_not_called()
 
     def test_sensor_edge_in_window_keeps_check(self):
         model = self._model()
         with patch(self.LATER) as later:
-            model.state_entity_state_change(self._event(self.E108I, "on", "off"))
+            for e in self.ENTITIES:
+                model.state_entity_state_change(self._event(e, "on", "off"))
             model.sensor_on()
             assert model.state == "active_timer"
-            self._live(model, "on", {self.E108I: "off"})
+            self._live(model, "off")
             self._fire(later)
-        assert model.state == "blocked"
+        assert model.state == "idle"
 
     def test_change_after_a_fired_window_opens_a_new_one(self):
         """A fired window frees its slot: the next change is not merged into it."""
@@ -2749,11 +2982,12 @@ class TestStateChangeDebounce:
             self._fire(later, 0)
             assert model.state == "active_timer"
             assert model._debounce_window is None
-            model.state_entity_state_change(self._event(self.E108F, "on", "off"))
+            for e in self.ENTITIES:
+                model.state_entity_state_change(self._event(e, "on", "off"))
             assert later.call_count == 2
-            self._live(model, "on", {self.E108F: "off"})
+            self._live(model, "off")
             self._fire(later, 1)
-        assert model.state == "blocked"
+        assert model.state == "idle"
 
     def test_blocked_change_after_a_fired_window_opens_a_new_one(self):
         """blocked: bounce dropped, then the owner really switches the last
@@ -2819,9 +3053,11 @@ class TestStateChangeDebounce:
             assert model._debounce_window is fresh
             assert model.state == "active_timer"
             model.control.assert_not_called()
-            self._live(model, "on", {self.E108F: "off"})
+            for e in (self.E108I, self.PROXY):
+                model.state_entity_state_change(self._event(e, "on", "off"))
+            self._live(model, "off")
             self._fire(later, 1)
-        assert model.state == "blocked"
+        assert model.state == "idle"
 
     # -- attribute-only changes -----------------------------------------------
 
@@ -2894,20 +3130,25 @@ class TestStateChangeDebounce:
     # -- what is compared at the deadline -------------------------------------
 
     def test_unavailable_at_fire_compares_last_known_state(self):
-        """A real off followed by a link drop still counts."""
+        """A real off followed by a link drop still counts as a lasting off:
+        the timer keeps running, and the comeback as off is re-lit (resync)."""
         model = self._model()
+        model.entity.set_attr.reset_mock()
         with patch(self.LATER) as later:
             self._live(model, "on", {self.E108I: "off"})
             model.state_entity_state_change(self._event(self.E108I, "on", "off"))
             self._live(model, "on", {self.E108I: "unavailable"})
             model.state_entity_state_change(self._event(self.E108I, "off", "unavailable"))
             self._fire(later)
-            assert model.state == "blocked"
+            assert model.state == "active_timer"
+            model.control.assert_not_called()
+            assert self._attrs(model)["notes"] == "light.108_i switched off outside EC while another light is on; not blocked"
+            model.turn_on_control_entities.assert_not_called()
             self._live(model, "on", {self.E108I: "off"})
             model.state_entity_state_change(self._event(self.E108I, "unavailable", "off"))
             later.assert_called_once()
-        assert model.state == "blocked"
-        model.turn_on_control_entities.assert_not_called()
+        assert model.state == "active_timer"
+        model.turn_on_control_entities.assert_called_once()
 
     def test_unavailable_after_bounce_is_not_a_change(self):
         model = self._model()
@@ -2978,8 +3219,9 @@ class TestStateChangeDebounce:
         model = self._model()
         with patch(self.LATER) as later:
             model.state_entity_state_change(self._event(self.E108I, "on", "off", ctx="dev-1"))
-            model.state_entity_state_change(self._event(self.E108F, "on", "off", ctx="dev-2"))
-            self._live(model, "on", {self.E108I: "off", self.E108F: "off"})
+            model.state_entity_state_change(self._event(
+                self.E108F, "on", "on", {"brightness": 100}, {"brightness": 50}, ctx="dev-2"))
+            self._live(model, "on", {self.E108I: "off", self.E108F: self._st("on", brightness=50)})
             self._fire(later)
         assert model.state == "blocked"
         assert model.context.parent_id == "dev-2"
@@ -2989,11 +3231,12 @@ class TestStateChangeDebounce:
     @pytest.mark.parametrize("debounce", [0, None])
     def test_debounce_off_acts_at_once(self, debounce):
         model = self._model(debounce=debounce)
-        self._live(model, "on", {self.E108I: "off"})
+        self._live(model, "off")
         with patch(self.LATER) as later:
             model.state_entity_state_change(self._event(self.E108I, "on", "off"))
             model.control.assert_called_once()
         later.assert_not_called()
+        assert model.state == "idle"
 
     @pytest.mark.parametrize(
         "cfg, expected, errors",
@@ -3142,9 +3385,11 @@ class TestStateChangeDebounce:
             self._fire(later, 0)
             model.enable.assert_not_called()
             assert model.state == "active_timer"
-            self._live(model, "on", {self.E108F: "off"})
+            for e in (self.E108I, self.PROXY):
+                model.state_entity_state_change(self._event(e, "on", "off"))
+            self._live(model, "off")
             self._fire(later, 1)
-        assert model.state == "blocked"
+        assert model.state == "idle"
 
     def test_active_stay_on_exit_clears_window(self):
         model = self._model("active_stay_on")
