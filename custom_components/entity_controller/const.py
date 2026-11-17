@@ -116,6 +116,8 @@ CONF_BLOCK_ON_EXTERNAL_ON = "block_on_external_on"
 # Longest a block may last, counted from its first entry (2026-11-17: motion
 # onsets kept ec_108f blocked for 52 min); null = no cap.
 CONF_BLOCK_MAX_SECONDS = "block_max_seconds"
+# Switch EC-lit lights off in a shutdown job when Home Assistant stops.
+CONF_TURN_OFF_ON_STOP = "turn_off_on_stop"
 CONF_SENSOR_TYPE_DURATION = "sensor_type_duration"
 CONF_SENSOR_TYPE = "sensor_type"
 CONF_SENSOR_RESETS_TIMER = "sensor_resets_timer"

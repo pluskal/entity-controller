@@ -285,6 +285,9 @@ def _build_model(hass=None, entity=None, config=None):
         m._block_anchor = m._block_timer_started = 0.0
         m.block_max_seconds = None
         m._block_started_at = None
+        m.turn_off_on_stop = False
+        m._stopping = False
+        m._stop_calls = None
         m.block_timeout = None
         m.grace_period = None
         m.ignore_state_changes_until = datetime.now()
@@ -1333,6 +1336,71 @@ class TestStatePersistence:
         asyncio.run(model._async_save_state())
         saved = model._store.async_save.call_args[0][0]
         assert saved["state"] == "active_timer" and saved["expires_at"] == str(expiry)
+
+    @pytest.mark.parametrize("then", ["comeback-on", "override-on", "switched-on-during-the-wait",
+                                      "timeout", "settled"])
+    def test_restore_wait_after_the_stop_job(self, then):
+        """turn_off_on_stop: after the shutdown job (stage 1 of a stop, before
+        hass.is_stopping) a light that returns on while a restored timer waits
+        is switched off and idle is saved, instead of the timer resuming with
+        the light on through the downtime. An override that turns on, or a
+        light switched on during the wait, is left alone as at any restore;
+        the bound and the settle re-check do nothing and the stop saves the
+        timer as before."""
+        lights = ({"light.a": "off", "light.b": "unavailable"} if then == "switched-on-during-the-wait"
+                  else {"light.a": "unavailable", "light.b": "unavailable", "input_boolean.ov": "off"})
+        model, live, expiry, _ = self._waiting_model(
+            150, lights, sensor="off", overrides=["input_boolean.ov"] if then == "override-on" else ())
+        wait = model._restore_wait
+        if then == "settled":
+            for e in ("light.a", "light.b"):
+                live[e] = "off"
+                self._later(model._restore_wait_event, wait, self._ev(e, "unavailable", "off"))
+            assert wait.settle is not None and model.state == "pending"
+        elif then == "switched-on-during-the-wait":
+            live["light.a"] = "on"
+            self._later(model._restore_wait_event, wait, self._ev("light.a", "off", "on"))
+            assert wait.switched_on == {"light.a"} and model.state == "pending"
+        model.turn_off_on_stop = True
+        asyncio.run(model._async_turn_off_on_stop())
+        assert model._stopping is True and model.state == "pending"
+        model._schedule_save_state = MagicMock(side_effect=model._schedule_save_state)
+        model.entity.set_attr.reset_mock()
+        if then == "comeback-on":
+            live["light.a"] = "on"
+            timer = self._later(model._restore_wait_event, wait, self._ev("light.a", "unavailable", "on"))
+        elif then == "override-on":
+            live["input_boolean.ov"] = "on"
+            timer = self._later(model._restore_wait_event, wait, self._ev("input_boolean.ov", "off", "on"))
+        elif then == "switched-on-during-the-wait":
+            live["light.b"] = "on"
+            timer = self._later(model._restore_wait_event, wait, self._ev("light.b", "unavailable", "on"))
+        elif then == "timeout":
+            timer = self._later(model._restore_wait_timeout, wait, None)
+        else:
+            timer = self._later(model._restore_wait_settled, wait)
+        model.turn_on_control_entities.assert_not_called()
+        model.hass.services.async_call.assert_not_called()
+        asyncio.run(model._async_save_state())
+        saved = model._store.async_save.call_args[0][0]
+        if then == "comeback-on":
+            assert model.state == "idle" and model._restore_wait is None
+            model.turn_off_control_entities.assert_called_once()
+            model._schedule_save_state.assert_called_once()
+            notes = [c.args[1] for c in model.entity.set_attr.call_args_list if c.args[0] == "notes"]
+            assert notes[-1] == "Home Assistant is stopping: lights from before the restart switched off"
+            timer.assert_not_called()
+            assert saved["state"] == "idle"
+            return
+        model.turn_off_control_entities.assert_not_called()
+        if then == "override-on":
+            assert model.state == "overridden" and saved["state"] == "overridden"
+        elif then == "switched-on-during-the-wait":
+            assert model.state == "blocked" and saved["state"] == "blocked"
+        else:
+            assert model.state == "pending" and model._restore_wait is wait
+            timer.assert_not_called()
+            assert saved["state"] == "active_timer" and saved["expires_at"] == str(expiry)
 
     def test_forced_sensor_during_the_wait_activates(self):
         model, _, _, _ = self._waiting_model(150, {"light.a": "unavailable", "light.b": "off"})
@@ -4763,3 +4831,398 @@ class TestBlockedHoldSensors:
         assert entity.attributes.get("block_max_seconds") == expected
         assert ("block_max_seconds" in entity.attributes) is (expected is not None)
         assert "blocked_at" not in entity.attributes
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-17 – turn_off_on_stop: EC-lit lights go off before Home Assistant stops
+# ---------------------------------------------------------------------------
+
+class TestTurnOffOnStop:
+    """A shutdown job (before homeassistant_stop, integrations still
+    connected) ends a running activation: one turn-off pass with blocking
+    calls, state idle, saved. From then on EC switches nothing on and
+    ignores its sensors. Other states are left alone.
+
+    Incident 2026-11-17: the host was shut down at 15:56 with ec_108f in
+    active_timer; the pergola lights stayed on for 3 h 41 min."""
+
+    F, I, PROXY = "light.108_f", "light.108_i", "input_boolean.108_led_proxy_ec"
+    ENTITIES = (F, I, PROXY)
+    PIR, RADAR, FORCED = "binary_sensor.pir", "binary_sensor.radar", "binary_sensor.forced"
+    OVERRIDE = "input_boolean.disable_ec_108f"
+    MODULE = "custom_components.entity_controller"
+    TIMER = MODULE + ".Timer"
+    NO_SAVE = MODULE + ".asyncio.run_coroutine_threadsafe"
+    NOTES = "Home Assistant is stopping: lights switched off (was %s)"
+
+    def _no_save(self):
+        return patch(self.NO_SAVE, side_effect=lambda coro, loop: coro.close())
+
+    @staticmethod
+    def _event(entity, old, new):
+        ev = MagicMock()
+        ev.data = {
+            "entity_id": entity,
+            "old_state": MagicMock(state=old, attributes={}),
+            "new_state": MagicMock(state=new, attributes={}, context=MagicMock(id="device-ctx")),
+        }
+        return ev
+
+    def _model(self, state="active_timer"):
+        """ec_108f shape with the option on, in `state`; self.live holds the
+        entity states."""
+        from homeassistant.util import dt as dt_util
+        now = dt_util.utcnow()
+        model = _build_model()
+        model.turn_off_on_stop = True
+        model.controlEntities = list(self.ENTITIES)
+        model.stateEntities = list(self.ENTITIES)
+        model.sensorEntities = [self.PIR]
+        model.holdSensorEntities = [self.RADAR]
+        model.hold_max_seconds = 7200
+        model.overrideEntities = [self.OVERRIDE]
+        model.sensor_type = "duration"
+        model.block_timeout = 1800
+        self.live = dict.fromkeys(
+            self.ENTITIES + (self.PIR, self.RADAR, self.FORCED, self.OVERRIDE), "off")
+        model.hass.states.get = MagicMock(side_effect=lambda e: MagicMock(
+            state=self.live[e], attributes={}, last_changed=now))
+        with patch(self.TIMER), self._no_save():
+            if state in ("active_timer", "active_stay_on"):
+                model.stay = state == "active_stay_on"
+                model.sensor_on()
+                self.live.update(dict.fromkeys(self.ENTITIES, "on"))
+            elif state == "blocked":
+                self.live[self.F] = "on"
+                model.sensor_on()
+            elif state != "idle":
+                {"pending": model.to_pending, "overridden": model.override,
+                 "constrained": model.constrain}[state]()
+        assert model.state == state
+        model.hass.services.async_call.reset_mock()
+        model.entity.set_attr.reset_mock()
+        model._start_timer.reset_mock()
+        model._cancel_timer.reset_mock()
+        model._store = MagicMock()
+        model._store.async_save = AsyncMock()
+        model.turn_off_control_entities = MagicMock(side_effect=model.turn_off_control_entities)
+        return model
+
+    def _stop(self, model, timeout=None):
+        """Run the shutdown job without its settle pause; timeout: a short
+        STOP_TURN_OFF_TIMEOUT for the tests in which something hangs."""
+        from custom_components.entity_controller import STOP_TURN_OFF_TIMEOUT
+        with patch(self.MODULE + ".STOP_SETTLE_SECONDS", 0), patch(
+                self.MODULE + ".STOP_TURN_OFF_TIMEOUT", timeout or STOP_TURN_OFF_TIMEOUT):
+            asyncio.run(model._async_turn_off_on_stop())
+
+    @staticmethod
+    def _notes(model):
+        return [c.args[1] for c in model.entity.set_attr.call_args_list if c.args[0] == "notes"]
+
+    @staticmethod
+    def _warnings(caplog):
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+    # -- the job ----------------------------------------------------------------
+
+    @pytest.mark.parametrize("state", ["active_timer", "active_stay_on"])
+    def test_stop_job_switches_off_and_goes_idle(self, state, caplog):
+        caplog.set_level(logging.WARNING)
+        model = self._model(state)
+        self._stop(model)
+        assert model.state == "idle" and model._stopping is True and model._stop_calls is None
+        calls = model.hass.services.async_call.call_args_list
+        assert [(c.args[0], c.args[1], c.args[2]["entity_id"]) for c in calls] == [
+            ("light", "turn_off", self.F), ("light", "turn_off", self.I),
+            ("input_boolean", "turn_off", self.PROXY)]
+        assert all(c.kwargs["blocking"] is True and c.kwargs["context"].id.startswith("ec_") for c in calls)
+        assert model.hass.services.async_call.await_count == 3
+        model.turn_off_control_entities.assert_called_once()  # none by on_enter_idle
+        model._cancel_timer.assert_called_once()
+        assert self._notes(model) == [self.NOTES % state]
+        model._store.async_save.assert_awaited_once()
+        assert model._store.async_save.call_args[0][0]["state"] == "idle"
+        assert not self._warnings(caplog)
+
+    def test_stop_job_starts_the_calls_before_it_saves(self):
+        """The turn-off calls are in flight before the save is awaited: by
+        the time the store has yielded once, all three have started."""
+        model = self._model()
+        started, seen = [], {}
+
+        async def call(domain, service, data, **kwargs):
+            started.append(data["entity_id"])
+
+        async def save(data):
+            await asyncio.sleep(0)
+            seen.update(started=list(started), state=data["state"])
+
+        model.hass.services.async_call = AsyncMock(side_effect=call)
+        model._store.async_save = save
+        self._stop(model)
+        assert seen == {"started": list(self.ENTITIES), "state": "idle"}
+
+    @pytest.mark.parametrize("save", ["raises", "hangs"])
+    def test_stop_job_turns_off_despite_the_save(self, save, caplog):
+        """A save that fails or hangs is logged; the turn-off and the settle
+        pause still happen, within the bound."""
+        import time
+        caplog.set_level(logging.WARNING)
+        model = self._model()
+
+        async def hang(data):
+            await asyncio.Event().wait()
+
+        model._store.async_save = AsyncMock(side_effect=OSError("disk full")) if save == "raises" else hang
+        started = time.monotonic()
+        with patch(self.MODULE + ".asyncio.sleep") as sleep:
+            self._stop(model, timeout=0.05)
+        assert time.monotonic() - started < 3
+        assert model.state == "idle"
+        assert model.hass.services.async_call.await_count == 3
+        sleep.assert_awaited_once_with(0)
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1 and "state not saved" in warnings[0]
+        assert self._notes(model) == [self.NOTES % "active_timer"]
+
+    def test_stop_job_names_unconfirmed_calls_in_notes(self, caplog):
+        """A logger default of error hides the WARNING, so a call that hung
+        or failed is named in notes as well."""
+        caplog.set_level(logging.WARNING)
+        model = self._model()
+
+        async def call(domain, service, data, **kwargs):
+            if data["entity_id"] == self.F:
+                await asyncio.Event().wait()
+            if data["entity_id"] == self.I:
+                raise RuntimeError("device offline")
+
+        model.hass.services.async_call = AsyncMock(side_effect=call)
+        self._stop(model, timeout=0.05)
+        assert model.state == "idle"
+        unconfirmed = "no confirmation from %s, %s" % (self.F, self.I)
+        assert self._notes(model) == [
+            self.NOTES % "active_timer", self.NOTES % "active_timer" + "; " + unconfirmed]
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1 and warnings[0].endswith(unconfirmed)
+        assert model._store.async_save.call_args[0][0]["state"] == "idle"
+
+    @pytest.mark.parametrize("state", ["pending", "idle", "blocked", "overridden", "constrained"])
+    def test_stop_job_leaves_other_states_alone(self, state):
+        """Only a running activation is ended: a light switched on by hand
+        (blocked, overridden) is not EC's to switch off."""
+        model = self._model(state)
+        with patch(self.MODULE + ".asyncio.sleep") as sleep:
+            self._stop(model)
+        assert model.state == state and model._stopping is True
+        model.hass.services.async_call.assert_not_called()
+        model.turn_off_control_entities.assert_not_called()
+        model._store.async_save.assert_not_called()
+        sleep.assert_not_called()
+        assert self._notes(model) == []
+
+    def test_stop_job_is_bounded_when_a_call_hangs(self, caplog):
+        import time
+        caplog.set_level(logging.WARNING)
+        model = self._model()
+        finished = []
+
+        async def call(domain, service, data, **kwargs):
+            if data["entity_id"] == self.F:
+                await asyncio.Event().wait()
+            finished.append(data["entity_id"])
+
+        model.hass.services.async_call = AsyncMock(side_effect=call)
+        started = time.monotonic()
+        self._stop(model, timeout=0.05)
+        assert time.monotonic() - started < 3
+        assert model.state == "idle"
+        assert finished == [self.I, self.PROXY]
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1 and warnings[0].endswith("no confirmation from " + self.F)
+
+    def test_stop_job_survives_a_failing_call(self, caplog):
+        caplog.set_level(logging.WARNING)
+        model = self._model()
+
+        async def call(domain, service, data, **kwargs):
+            if data["entity_id"] == self.I:
+                raise RuntimeError("device offline")
+
+        model.hass.services.async_call = AsyncMock(side_effect=call)
+        self._stop(model)
+        assert model.state == "idle"
+        assert model.hass.services.async_call.await_count == 3
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1 and warnings[0].endswith("no confirmation from " + self.I)
+
+    @pytest.mark.parametrize("case", ["lit", "nothing-to-switch"])
+    def test_stop_job_waits_for_a_mirroring_automation(self, case):
+        """After the calls the job stays STOP_SETTLE_SECONDS, so an
+        automation that mirrors a control entity gets its command out before
+        homeassistant_stop cancels it; not when nothing was switched."""
+        from custom_components.entity_controller import STOP_SETTLE_SECONDS
+        model = self._model()
+        if case == "nothing-to-switch":
+            model.controlEntities = []
+            model.activeControlEntities = []
+        order = []
+
+        async def call(domain, service, data, **kwargs):
+            order.append(data["entity_id"])
+
+        async def pause(seconds):
+            order.append("pause %s" % seconds)
+
+        model.hass.services.async_call = AsyncMock(side_effect=call)
+        with patch(self.MODULE + ".asyncio.sleep", side_effect=pause) as sleep:
+            asyncio.run(model._async_turn_off_on_stop())
+        assert model.state == "idle"
+        if case == "lit":
+            assert STOP_SETTLE_SECONDS == 3
+            assert order == list(self.ENTITIES) + ["pause 3"]
+            sleep.assert_awaited_once_with(3)
+        else:
+            assert order == []
+            sleep.assert_not_called()
+
+    # -- after the job ----------------------------------------------------------
+
+    @pytest.mark.parametrize("state", ["active_timer", "blocked"])
+    @pytest.mark.parametrize("kind", ["sensor", "hold", "forced", "bus-event"])
+    def test_after_the_stop_job_sensors_are_ignored(self, kind, state):
+        """Until the process exits no sensor edge acts: not in idle after
+        the job's turn-off, not in a block the job left alone."""
+        model = self._model(state)
+        self._stop(model)
+        after = "idle" if state == "active_timer" else state
+        assert model.state == after
+        if state == "active_timer":
+            self.live.update(dict.fromkeys(self.ENTITIES, "off"))
+        model.hass.services.async_call.reset_mock()
+        model._block_timer_started -= 61
+        model.set_context = MagicMock()
+        with patch(self.TIMER) as timer, self._no_save():
+            if kind == "sensor":
+                self.live[self.PIR] = "on"
+                model.sensor_state_change(self._event(self.PIR, "off", "on"))
+            elif kind == "hold":
+                self.live[self.RADAR] = "on"
+                model.hold_sensor_state_change(self._event(self.RADAR, "off", "on"))
+            elif kind == "forced":
+                self.live[self.FORCED] = "on"
+                model.forced_sensor_state_change(self._event(self.FORCED, "off", "on"))
+            else:
+                model.ha_event_sensor_callback("doorbell", MagicMock())
+        assert model.state == after
+        timer.assert_not_called()
+        model._start_timer.assert_not_called()
+        model.set_context.assert_not_called()
+        model.hass.services.async_call.assert_not_called()
+
+    @pytest.mark.parametrize("case", ["override-released", "block-expiry", "activate-service"])
+    def test_after_the_stop_job_nothing_is_switched_on(self, case):
+        """Triggers that are not sensor edges may still move the state, but
+        nothing is switched on any more."""
+        state = {"override-released": "overridden", "block-expiry": "blocked",
+                 "activate-service": "active_timer"}[case]
+        model = self._model(state)
+        self._stop(model)
+        model.hass.services.async_call.reset_mock()
+        with patch(self.TIMER), self._no_save():
+            if case == "override-released":
+                self.live.update({self.F: "on", self.PIR: "on"})
+                model.override_state_change(self._event(self.OVERRIDE, "on", "off"))
+            elif case == "block-expiry":
+                self.live[self.PIR] = "on"
+                model.block_timer_expire()
+            else:
+                assert model.state == "idle"
+                self.live.update(dict.fromkeys(self.ENTITIES, "off"))
+                model.activate()  # what entity_controller.activate calls
+        assert model.state == "active_timer"
+        model.hass.services.async_call.assert_not_called()
+
+    def test_after_the_stop_job_a_light_returning_on_is_still_switched_off(self):
+        """The latch stops turn-ons only: light.108_f missed the job's
+        turn-off and returns on before the process exits."""
+        model = self._model()
+        self.live[self.F] = "unavailable"
+        self._stop(model)
+        self.live.update({self.F: "on", self.I: "off", self.PROXY: "off"})
+        model.hass.services.async_call.reset_mock()
+        with self._no_save():
+            model.state_entity_state_change(self._event(self.F, "unavailable", "on"))
+        assert model.state == "idle"
+        calls = model.hass.services.async_call.call_args_list
+        assert [(c.args[1], c.args[2]["entity_id"]) for c in calls] == [
+            ("turn_off", e) for e in self.ENTITIES]
+        assert all("blocking" not in c.kwargs for c in calls)
+
+    # -- the option -------------------------------------------------------------
+
+    @pytest.mark.parametrize("option", [True, False], ids=["on", "off"])
+    def test_stop_job_registration(self, option):
+        from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+        from homeassistant.core import HassJob, HassJobType
+        model = _build_model()
+        model.turn_off_on_stop = option
+        model._register_stop_handlers()
+        model.hass.bus.async_listen_once.assert_called_once_with(
+            EVENT_HOMEASSISTANT_STOP, model._async_save_state)
+        if option:
+            model.hass.async_add_shutdown_job.assert_called_once()
+            (job,) = model.hass.async_add_shutdown_job.call_args[0]
+            assert isinstance(job, HassJob) and job.job_type is HassJobType.Coroutinefunction
+            assert job.target == model._async_turn_off_on_stop
+        else:
+            model.hass.async_add_shutdown_job.assert_not_called()
+
+    @pytest.mark.parametrize("cfg, expected, errors", [
+        ({}, False, 0),
+        ({"turn_off_on_stop": True}, True, 0),
+        ({"turn_off_on_stop": False}, False, 0),
+        ({"turn_off_on_stop": "true"}, False, 1),
+        ({"turn_off_on_stop": 1}, False, 1),
+        ({"turn_off_on_stop": None}, False, 1),
+    ], ids=["unset", "true", "false", "str-true", "one", "null"])
+    def test_turn_off_on_stop_parsing(self, caplog, cfg, expected, errors):
+        """Only a YAML true/false is accepted; the value is always shown as
+        an attribute and kept on an idle entry."""
+        from custom_components.entity_controller import EntityController
+        caplog.set_level(logging.INFO)
+        entity = EntityController.__new__(EntityController)
+        entity.attributes, entity.may_update = {}, False
+        entity.async_set_context = MagicMock()
+        model = _build_model(entity=entity)
+        model.turn_off_on_stop = None
+        model.config_other(cfg)
+        assert model.turn_off_on_stop is expected
+        assert sum(r.levelno == logging.ERROR for r in caplog.records) == errors
+        model.update(blocked_at=datetime.now())
+        model.constrain()
+        model.enable()  # constrained -> idle: on_enter_idle -> reset_state
+        assert model.state == "idle"
+        assert entity.attributes["turn_off_on_stop"] is expected
+        assert "blocked_at" not in entity.attributes
+
+    def test_option_off_is_9_12_0(self):
+        """Without the option no job is registered, nothing sets the latch
+        and a service call is scheduled as before, without blocking."""
+        model = self._model()
+        model.turn_off_on_stop = False
+        model._register_stop_handlers()
+        model.hass.async_add_shutdown_job.assert_not_called()
+        assert model._stopping is False and model._stop_calls is None
+        with patch(self.NO_SAVE) as schedule:
+            model.call_service(self.F, "turn_off")
+        schedule.assert_called_once()
+        coro, loop = schedule.call_args.args
+        coro.close()
+        assert loop is model.hass.loop
+        model.hass.services.async_call.assert_called_once_with(
+            "light", "turn_off", {"entity_id": self.F}, context=model.context)
+        self.live[self.PIR] = "on"
+        model.sensor_state_change(self._event(self.PIR, "off", "on"))
+        model._start_timer.assert_called_once()  # a sensor edge still restarts the timer

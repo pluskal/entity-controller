@@ -151,7 +151,7 @@ Semantics:
 
 ## State Persistence
 
-EC persists its state across Home Assistant restarts using the built-in HA storage layer: `overridden`, `blocked` (with the time the block began) and a running timer (`active_timer`, with the time it was due to run out). The state is saved when Home Assistant stops and whenever EC enters or leaves `overridden` or `blocked`. On startup it is checked against the live entity states before it is applied: if an override entity is on, EC starts in `overridden`; if every state entity is off, it starts in `idle`, as on a normal start.
+EC persists its state across Home Assistant restarts using the built-in HA storage layer: `overridden`, `blocked` (with the time the block began) and a running timer (`active_timer`, with the time it was due to run out). The state is saved when Home Assistant stops and whenever EC enters or leaves `overridden` or `blocked` (with `turn_off_on_stop`, a running timer is ended at the stop and `idle` is saved; see Switch Off on Stop). On startup it is checked against the live entity states before it is applied: if an override entity is on, EC starts in `overridden`; if every state entity is off, it starts in `idle`, as on a normal start.
 
 - A restored `blocked` state leaves the lights as they are and re-arms the block timer with `block_timeout`, cut to what `block_max_seconds` leaves (see Block Cap).
 - A restored timer never switches the lights off at startup while a sensor or hold sensor is on or has not reported yet (Zigbee2MQTT sensors are often still `unknown` then). It resumes with the time that was left, but at least the configured `delay` while a sensor has not reported, and with the `delay` (the night delay at night) when it had run out by the restart. Only a timer that ran out with every sensor reporting off switches the lights off, once. The resumed time never exceeds the longest timer the instance can run (the day or night `delay`, `backoff_max` with `backoff: true`): the saved time is local wall-clock time, which a daylight-saving change or a clock step would otherwise stretch.
@@ -297,3 +297,28 @@ entity_controller:
 - Each block has its own count. A block entered from another state (from `idle`, after an activation, an override or `constrained`) starts a new one; only the re-entry by a motion onset keeps the first entry.
 - After a restart the count continues: the first entry is saved with the `blocked` state, and the restored block timer is cut to what is left, but to no less than one `delay` (the night delay at night), so a block whose cap ran out while Home Assistant was down does not end the moment it is restored. A state file written before 9.13.0 has no saved entry; the count then starts at the restore.
 - The count uses wall-clock time so that it survives a restart. A clock step back can lengthen one block by that step; a step forward shortens it.
+
+## Switch Off on Stop (`turn_off_on_stop`)
+
+**Problem:** When Home Assistant stops while EC's timer runs, the lights EC switched on stay on for as long as Home Assistant is down: the timer is saved and resumed at the next start, but nothing switches the lights off in between (2026-11-17: the host was shut down at 15:56 with ec_108f in `active_timer`, and the pergola lights stayed on for 3 h 41 min).
+
+**Solution:** With `turn_off_on_stop: true`, EC ends a running activation when Home Assistant stops cleanly. It does so in a shutdown job, which Home Assistant runs before the `homeassistant_stop` event, while the integrations are still connected.
+
+```yaml
+entity_controller:
+  pergola:
+    sensor: binary_sensor.pergola_motion
+    entity: light.pergola
+    turn_off_on_stop: true
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `turn_off_on_stop` | boolean | `false` | Switch the control entities off when Home Assistant stops while EC is `active`, `active_timer` or `active_stay_on`. Only a YAML `true`/`false` is accepted; anything else logs an error and uses `false`. The value is always shown as the `turn_off_on_stop` attribute. |
+
+- Only a running activation is ended (`active`, `active_timer`, `active_stay_on`). In `pending` (but see the restored timer below), `idle`, `blocked`, `overridden` and `constrained` nothing is switched: a light switched on by hand is not EC's to switch off. The state alone decides. Lights EC adopted earlier (a block that ended with a sensor on, a forced sensor) count as EC's; in a block, the lights EC had switched on before it began stay on too.
+- The order: EC starts the turn-off calls (the usual turn-off pass, `trigger_on_deactivate` included), goes `idle`, saves `idle`, then waits up to 5 seconds (counted from the calls) for them to finish and 3 more seconds for automations that mirror a control entity. A save that fails does not stop the turn-off. A call without confirmation is logged (WARNING) and named in the `notes` attribute.
+- From then until the process exits, EC ignores its sensors, hold sensors, forced sensors and event sensors and switches nothing on, in every state. Turn-offs still go out, for example for a light that returns `on` from `unavailable`. A restored timer that still waits for its lights after a start (see State Persistence) does not resume: when one of its lights returns on, EC switches the lights off and saves `idle`, unless an override is on or a light was switched on during the wait (those are left alone, as at any restore). Without such a return the wait goes on and the stop saves the timer, as on any stop during the wait.
+- A restart darkens a room EC has lit, also with people in it. After the restart EC starts in `idle`. The light comes back at the next sensor ON edge; a sensor that is already on at the start does not switch it on.
+- It needs a clean stop. A crash, a kill or a power cut runs no shutdown job; neither does a stop in the first 70 seconds after EC was set up, before EC has registered its handlers. Home Assistant gives all shutdown jobs 20 seconds together; EC's takes at most 8.
+- It needs a Home Assistant core that has shutdown jobs (`hass.async_add_shutdown_job`).

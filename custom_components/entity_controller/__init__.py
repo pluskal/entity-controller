@@ -37,7 +37,7 @@ from typing import Optional, List
 import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
 from homeassistant.const import CONF_NAME, SUN_EVENT_SUNRISE, SUN_EVENT_SUNSET
-from homeassistant.core import callback, Context
+from homeassistant.core import callback, Context, HassJob
 from homeassistant.helpers import entity, event, service
 from homeassistant.helpers.template import Template
 from homeassistant.helpers.entity_component import EntityComponent
@@ -99,6 +99,7 @@ from .const import (
     CONF_DISABLE_BLOCK,
     CONF_BLOCK_ON_EXTERNAL_ON,
     CONF_BLOCK_MAX_SECONDS,
+    CONF_TURN_OFF_ON_STOP,
     CONF_SENSOR_TYPE_DURATION,
     CONF_SENSOR_TYPE,
     CONF_SENSOR_RESETS_TIMER,
@@ -154,6 +155,12 @@ RESTORE_WAIT_SECONDS = 300
 # (2026-11-10; the 103 radar flips about 54 times a day).
 HOLD_REARM_THROTTLE = 60
 
+# turn_off_on_stop: longest wait for the turn-off calls, then a pause so an
+# automation that mirrors a control entity can send its own command before
+# homeassistant_stop cancels it.
+STOP_TURN_OFF_TIMEOUT = 5
+STOP_SETTLE_SECONDS = 3
+
 devices = []
 MODE_SCHEMA = vol.Schema(
     vol.All(
@@ -207,6 +214,7 @@ ENTITY_SCHEMA = vol.Schema(
         # documentation only; runtime accepts a real bool (config_other)
         vol.Optional(CONF_BLOCK_ON_EXTERNAL_ON, default=True): cv.boolean,
         vol.Optional(CONF_BLOCK_MAX_SECONDS, default=None): vol.Any(None, vol.Coerce(float)),
+        vol.Optional(CONF_TURN_OFF_ON_STOP, default=False): cv.boolean,
         vol.Optional(CONF_IGNORE_STATE_CHANGES_UNTIL, default=None): vol.Any(None, cv.positive_int),
         vol.Optional(CONF_NIGHT_MODE, default=None): MODE_SCHEMA,
         vol.Optional(CONF_STATE_ATTRIBUTES_IGNORE, default=[]): cv.ensure_list,
@@ -593,6 +601,7 @@ class EntityController(entity.Entity):
             "lux_bright_states",
             "block_on_external_on",
             "block_max_seconds",
+            "turn_off_on_stop",
         ]
         for k, v in self.attributes.items():
             if k in PERSISTED_STATE_ATTRIBUTES:
@@ -708,6 +717,9 @@ class Model:
         self._block_anchor = self._block_timer_started = 0.0
         self.block_max_seconds = None
         self._block_started_at = None  # UTC, first entry into the current block
+        self.turn_off_on_stop = False
+        self._stopping = False  # set by the shutdown job: nothing is switched on any more
+        self._stop_calls = None  # list while the shutdown job collects its turn-off calls
         self.night_mode_entity = None
         self.night_mode_entity_states = []
         self.nightControlEntities = []
@@ -758,7 +770,7 @@ class Model:
 
         # Phase 2: Set up state persistence store and register shutdown handler
         self._store = Store(self.hass, STORAGE_VERSION, self._storage_key())
-        self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self._async_save_state)
+        self._register_stop_handlers()
 
         # Phase 2: Attempt to restore persisted state before the first transition
         restored = await self._async_restore_state()
@@ -769,6 +781,50 @@ class Model:
                 self.update(overridden_at=str(datetime.now()))
             else:
                 self.start_monitoring()
+
+    def _register_stop_handlers(self):
+        self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self._async_save_state)
+        if self.turn_off_on_stop:
+            self.hass.async_add_shutdown_job(
+                HassJob(self._async_turn_off_on_stop, "entity_controller %s turn_off_on_stop" % self.name))
+
+    async def _async_turn_off_on_stop(self, *_args):
+        """Shutdown job: a running activation ends before the integrations
+        disconnect; from here on EC switches nothing on and ignores its sensors."""
+        self._stopping = True
+        if self.state not in ("active", "active_timer", "active_stay_on"):
+            return
+        was = self.state
+        self.set_context(None)
+        self._stop_calls = calls = []
+        try:
+            self.turn_off_control_entities()
+            self.to_idle()
+        finally:
+            # In flight before anything is awaited: a failing transition or
+            # save cannot stop the turn-off.
+            self._stop_calls = None
+            tasks = {asyncio.ensure_future(coro): entity for entity, coro in calls}
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + STOP_TURN_OFF_TIMEOUT
+        notes = "Home Assistant is stopping: lights switched off (was %s)" % was
+        self.update(notes=notes)
+        try:
+            await asyncio.wait_for(self._async_save_state(), STOP_TURN_OFF_TIMEOUT)
+        except Exception as err:
+            self.log.warning("turn_off_on_stop :: state not saved: %r", err)
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(tasks, timeout=max(deadline - loop.time(), 0))
+        for task in pending:
+            task.cancel()
+        failed = sorted({tasks[t] for t in pending}
+                        | {tasks[t] for t in done if not t.cancelled() and t.exception()})
+        if failed:
+            # also in notes: a logger default of error hides the WARNING
+            self.log.warning("turn_off_on_stop :: no confirmation from %s", ", ".join(failed))
+            self.update(notes="%s; no confirmation from %s" % (notes, ", ".join(failed)))
+        await asyncio.sleep(STOP_SETTLE_SECONDS)
 
     def update(self, wait=False, **kwargs):
         """ Called from different methods to report a state attribute change """
@@ -793,6 +849,8 @@ class Model:
     @callback
     def sensor_state_change(self, event):
         """ State change callback for sensor entities """
+        if self._stopping:
+            return
         entity = event.data["entity_id"]
         old = event.data["old_state"]
         new = event.data["new_state"]
@@ -901,6 +959,8 @@ class Model:
     @callback
     def hold_sensor_state_change(self, event):
         """Hold sensor: keeps the light on, but never switches it on."""
+        if self._stopping:
+            return
         entity = event.data["entity_id"]
         old = event.data["old_state"]
         new = event.data["new_state"]
@@ -1310,6 +1370,8 @@ class Model:
         Forced sensors bypass blocked, constrained, and overridden states and
         immediately activate the controller.
         """
+        if self._stopping:
+            return
         entity_id = ev.data["entity_id"]
         old = ev.data["old_state"]
         new = ev.data["new_state"]
@@ -1342,6 +1404,8 @@ class Model:
         Subscribes to arbitrary HA bus events and triggers sensor_on when
         the configured event fires, regardless of any attached event data.
         """
+        if self._stopping:
+            return
         self.log.debug(
             "ha_event_sensor_callback :: Received HA bus event '%s' (state=%s)",
             event_type,
@@ -1701,7 +1765,8 @@ class Model:
         self._debounce_window = None
         # Entering idle due to no events, set a new context with no parent
         self.set_context(None)
-        if not quiet:
+        # not while the shutdown job collects: it already made the turn-off pass
+        if not quiet and self._stop_calls is None:
             self.do_transition_behaviour(CONF_ON_ENTER_IDLE)
         self.entity.reset_state()
 
@@ -2233,6 +2298,12 @@ class Model:
                 cap = None
         self.block_max_seconds = cap
         self.update(block_max_seconds=cap)  # update() skips None: no attribute without a cap
+        stop_off = config.get(CONF_TURN_OFF_ON_STOP, False)
+        if not isinstance(stop_off, bool):
+            self.log.error("turn_off_on_stop must be true or false, got %r; using false", stop_off)
+            stop_off = False
+        self.turn_off_on_stop = stop_off
+        self.update(turn_off_on_stop=stop_off)
         self.image_prefix = config.get("image_prefix", "/fsm_diagram_")
         self.image_path = config.get("image_path", "/conf/temp")
         self.backoff = config.get("backoff", False)
@@ -2446,15 +2517,26 @@ class Model:
         sensor_on, sensor_unknown = self._restore_sensor_knowledge()
         delay, cap = self._restore_delays()
         remaining = (expiry - datetime.now()).total_seconds()
-        if remaining <= 1 and not (sensor_on or sensor_unknown):
+        stopping = self._stopping
+        if stopping or (remaining <= 1 and not (sensor_on or sensor_unknown)):
             # Ran out while HA was down and every sensor reports off: one
-            # turn-off, whatever on_enter_idle says.
-            self.log.info(
-                "_restore_timer :: timer ran out while HA was down (%s) and no sensor "
-                "holds the light, turning control entities off", expiry)
+            # turn-off, whatever on_enter_idle says. Also when a light returns
+            # after the turn_off_on_stop job: off before the integrations
+            # disconnect, instead of on through the downtime.
+            if stopping:
+                self.log.info("_restore_timer :: Home Assistant is stopping, turning the lights "
+                              "from before the restart off")
+            else:
+                self.log.info(
+                    "_restore_timer :: timer ran out while HA was down (%s) and no sensor "
+                    "holds the light, turning control entities off", expiry)
             self.start_monitoring(quiet=True)
             self.turn_off_control_entities()
-            self.update(notes="Timer ran out while HA was down and no sensor holds the light — entities turned off")
+            if stopping:
+                self.update(notes="Home Assistant is stopping: lights from before the restart switched off")
+                self._schedule_save_state()
+            else:
+                self.update(notes="Timer ran out while HA was down and no sensor holds the light — entities turned off")
             return True
         if remaining <= 1:
             # A sensor holds the light, or has not reported yet (Zigbee2MQTT
@@ -2560,7 +2642,9 @@ class Model:
 
     @callback
     def _restore_wait_event(self, wait, ev):
-        """A light or override entity changed while a restored timer waits."""
+        """A light or override entity changed while a restored timer waits.
+        After the turn_off_on_stop job a comeback still counts: _restore_timer
+        then switches the lights off."""
         if self._restore_wait is not wait or self.hass.is_stopping:
             return
         entity = ev.data["entity_id"]
@@ -2589,7 +2673,7 @@ class Model:
     @callback
     def _restore_wait_timeout(self, wait, _now=None):
         """The lights of a restored timer did not report in time."""
-        if self._restore_wait is not wait or self.hass.is_stopping or not self.is_pending():
+        if self._restore_wait is not wait or self.hass.is_stopping or self._stopping or not self.is_pending():
             return
         self.log.warning(
             "_restore_wait_timeout :: lights still not reachable after %d s; ending the wait "
@@ -2612,7 +2696,7 @@ class Model:
     @callback
     def _restore_wait_settled(self, wait, _now=None):
         """The lights stayed off for state_change_debounce after coming back."""
-        if self._restore_wait is not wait or self.hass.is_stopping or not self.is_pending():
+        if self._restore_wait is not wait or self.hass.is_stopping or self._stopping or not self.is_pending():
             return
         wait.settle = None
         self._restore_timer(wait.expiry, settled=True)
@@ -2817,6 +2901,9 @@ class Model:
                     self.call_service(e, "turn_on")
 
     def turn_on_control_entities(self):
+        if self._stopping:
+            self.log.debug("turn_on_control_entities :: Home Assistant is stopping, nothing is switched on")
+            return
         self.handleTriggerOnActivateEntities()
 
         for e in self.activeControlEntities or self.controlEntities:
@@ -3102,10 +3189,15 @@ class Model:
             params = service_data
 
         params["entity_id"] = entity
-        asyncio.run_coroutine_threadsafe(
-            self.hass.services.async_call(domain, service, service_data, context=self.context),
-            self.hass.loop
-        )
+        if self._stop_calls is not None:
+            # the shutdown job starts and awaits these itself
+            self._stop_calls.append((entity, self.hass.services.async_call(
+                domain, service, service_data, blocking=True, context=self.context)))
+        else:
+            asyncio.run_coroutine_threadsafe(
+                self.hass.services.async_call(domain, service, service_data, context=self.context),
+                self.hass.loop
+            )
         self.update(service_data=service_data)
 
     def set_context(self, parent: Optional[Context] = None) -> None:
