@@ -4370,6 +4370,7 @@ class TestBlockedHoldSensors:
             first = model.block_timer_handle
             timers.append(first)
             assert isinstance(first, threading.Timer) and first.is_alive()
+            assert first.daemon
             stray = threading.Timer(0.01, model.block_timer_expire)
             timers.append(stray)
             stray.start()
@@ -4393,6 +4394,33 @@ class TestBlockedHoldSensors:
         assert model.state == "idle"
         model.turn_off_control_entities.assert_called_once()
         assert model.block_timer_handle is None
+
+    @pytest.mark.parametrize("which", ["timer", "block-timer"])
+    def test_timer_threads_are_daemon(self, which):
+        """A pending EC timer must not hold the process at exit (Home
+        Assistant joins non-daemon threads for up to 10 s): daemon is set
+        before start()."""
+        at_start = []
+
+        def make_timer(*_args, **_kwargs):
+            handle = MagicMock()
+            handle.daemon = False
+            handle.start.side_effect = lambda: at_start.append(handle.daemon)
+            return handle
+
+        with patch(self.TIMER, side_effect=make_timer) as timer:
+            model = self._model()
+            if which == "timer":
+                del model._start_timer
+                model.sensor_on()
+                assert model.state == "active_timer"
+                handle, expire = model.timer_handle, model.timer_expire
+            else:
+                self._take_over(model, self.L1)
+                handle, expire = model.block_timer_handle, model.block_timer_expire
+        timer.assert_called_once()
+        assert timer.call_args[0][1] == expire
+        assert at_start == [True] and handle.daemon is True
 
     def test_no_block_timeout_take_over(self):
         """block_timeout unset: B still blocks, without a timer; a hold edge

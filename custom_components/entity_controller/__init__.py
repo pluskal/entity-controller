@@ -1442,8 +1442,11 @@ class Model:
 
         # not able to use async_call_later because no known way to check whether timer is active.
         # self.timer_handle = event.async_call_later(self.hass, self.previous_delay, self.timer_expire)
-        self.timer_handle = Timer(delay, self.timer_expire)
-        self.timer_handle.start()
+        # daemon: a pending timer must not hold the process at exit
+        handle = Timer(delay, self.timer_expire)
+        handle.daemon = True
+        self.timer_handle = handle
+        handle.start()
         self._expiry_time = expiry_time
         self.update(expires_at=expiry_time)
 
@@ -1850,6 +1853,7 @@ class Model:
             old.cancel()
         self.block_timer_handle = new
         self._block_timer_started = self.hass.loop.time()
+        new.daemon = True
         new.start()
         self.update(block_timeout=self.block_timeout,
                     expires_at=datetime.now() + timedelta(seconds=seconds))
