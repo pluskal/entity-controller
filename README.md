@@ -151,9 +151,9 @@ Semantics:
 
 ## State Persistence
 
-EC persists its state across Home Assistant restarts using the built-in HA storage layer: `overridden`, `blocked` and a running timer (`active_timer`, with the time it was due to run out). The state is saved when Home Assistant stops and whenever EC enters or leaves `overridden` or `blocked`. On startup it is checked against the live entity states before it is applied: if an override entity is on, EC starts in `overridden`; if every state entity is off, it starts in `idle`, as on a normal start.
+EC persists its state across Home Assistant restarts using the built-in HA storage layer: `overridden`, `blocked` (with the time the block began) and a running timer (`active_timer`, with the time it was due to run out). The state is saved when Home Assistant stops and whenever EC enters or leaves `overridden` or `blocked` (with `turn_off_on_stop`, a running timer is ended at the stop and `idle` is saved; see Switch Off on Stop). On startup it is checked against the live entity states before it is applied: if an override entity is on, EC starts in `overridden`; if every state entity is off, it starts in `idle`, as on a normal start.
 
-- A restored `blocked` state leaves the lights as they are and re-arms the block timer.
+- A restored `blocked` state leaves the lights as they are and re-arms the block timer with `block_timeout`, cut to what `block_max_seconds` leaves (see Block Cap).
 - A restored timer never switches the lights off at startup while a sensor or hold sensor is on or has not reported yet (Zigbee2MQTT sensors are often still `unknown` then). It resumes with the time that was left, but at least the configured `delay` while a sensor has not reported, and with the `delay` (the night delay at night) when it had run out by the restart. Only a timer that ran out with every sensor reporting off switches the lights off, once. The resumed time never exceeds the longest timer the instance can run (the day or night `delay`, `backoff_max` with `backoff: true`): the saved time is local wall-clock time, which a daylight-saving change or a clock step would otherwise stretch.
 - A light that is still `unavailable` or `unknown` does not stop the timer while another light is on. When one returns from `unavailable`, the usual comeback resync applies (one that returns off is switched on while the timer runs); one that was still `unknown` is treated as described under Known limits. When no reachable light is on and some have not reported yet, EC waits in `pending` for up to 5 minutes: the first light that returns on resumes the timer as above, lights that all return off end in `idle` without a turn-off once they have stayed off for `state_change_debounce` (a Tasmota light reports a placeholder `off` 1–2 s before its real state, which then settles the timer as above), and after 5 minutes EC starts in `idle` without switching anything off. When the wait ends in `idle` and a regular (non-hold) sensor is on, EC acts on it as on a new motion edge (the edge itself is not seen during the wait). A light switched on during the wait (by hand or an automation) is not switched off by the restore: the wait then ends in `blocked`, also at the 5-minute bound while that light is still on, as for any light switched on outside EC while `idle` (see Block on External ON; with `block_on_external_on: false` or `disable_block: true` it ends in `idle`). This does not hold for a turn-on within `state_change_debounce` of that light's own return, which counts as its real state as above, nor across a stop of Home Assistant during the wait: the next start treats the light as EC's. An override that turns on, the end of the start/end window (constrain) or a forced sensor ends the wait.
 
@@ -194,7 +194,7 @@ entity_controller:
 
 **Problem:** Some devices report a short `on -> off -> on` bounce (a relay re-reporting, a Wi-Fi blip) with a context that is not EC's own. EC read the first edge as manual control. In `active_timer` it went to `blocked`, or to `idle` (switching the lights off) if nothing else was on, or restarted the timer under `disable_block`. In `blocked`/`active_stay_on` the bounce of the last lit entity sent EC to `idle`, switching the light off.
 
-**Solution:** After an external change of a state entity in `active_timer`, `blocked` or `active_stay_on`, and in `idle` for a light switched on (see Block on External ON), EC waits `state_change_debounce` seconds. It then compares every entity that changed with its state before the first change. If all of them are back, the change is ignored; otherwise EC reacts once, as before. The window starts at the first change, and later changes do not extend it.
+**Solution:** After an external change of a state entity in `active_timer`, `blocked` or `active_stay_on`, and in `idle` for a light switched on (see Block on External ON), EC waits `state_change_debounce` seconds. It then compares every entity that changed with its state before the first change. If all of them are back, the change is ignored; otherwise EC reacts once, as before (except for a partial off while the timer runs, see below). The window starts at the first change, and later changes do not extend it.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -212,6 +212,17 @@ Known limits (set `0` on an instance where one of them matters; `0` also removes
 - An entity may return from `unavailable` inside the window while the timer runs. EC's resync then turns the lights back on, and the change is usually lost.
 - A Home Assistant restart inside the window drops the pending check.
 - After a real external off, a motion onset or `entity_controller.activate` that arrives inside the window only restarts the timer; at the deadline EC goes to `idle` and the light stays off until the next sensor onset (before 9.11.3 it was re-lit at once).
+
+## Partial OFF While the Timer Runs
+
+**Problem:** With several controlled lights, one of them going off for good while the timer ran (a relay dropping out, a wall switch) put EC in `blocked`, although the lights that were still on were the ones EC had switched on. Every motion onset then renewed the block and the other lights stayed on (2026-11-17 19:56:53: `light.108_i` reported off 67 s before the timer was due; ec_108f went `blocked` and three motion onsets kept the pergola lit until it was switched off by hand 52 minutes later).
+
+**Solution (9.13.0):** In `active_timer`, a state entity that goes from on to not on with a context that is not EC's own, and is still not on after `state_change_debounce`, no longer blocks while another light is on. EC stays in `active_timer` and touches neither the timer nor its expiry; when the timer runs out, EC switches the other lights off and goes to `idle`. EC logs `<light> switched off outside EC while another light is on; not blocked` (INFO) and names the light in `notes`. There is no option: the rule applies to every instance.
+
+- The timer is kept only when every change that persisted is such an off, and every light still on is one the timer will switch off (the control entities of the last activation). A lit light outside that set (the other mode's lamp with `night_mode: entities`, an entity listed only in `state_entities`) still puts EC in `blocked`, as before 9.13.0.
+- Any other change that persists blocks as before: a light switched on, a significant attribute change, or one of those in the same window as an off. A light that went off and later goes `off -> on` blocks too.
+- When no light is on any more, EC goes to `idle`, as before. With `disable_block: true` a partial off restarts the timer, as before. With `state_change_debounce` `0`/`null` the rule is applied to each change at once.
+- A motion onset before the timer runs out only restarts the timer; the light that was switched off stays off until the next activation. One exception: while the timer runs, any controlled light that returns `off` from `unavailable` makes EC switch all of them on again (the comeback resync, unchanged), including a lamp switched off by hand. That ends when the timer runs out.
 
 ## Block on External ON (`block_on_external_on`)
 
@@ -245,7 +256,7 @@ How the block ends:
 - With a sensor or hold sensor on, EC goes to `active`: it switches on every control entity of the current mode with that mode's `service_data` (a brightness set by hand is overwritten) and runs the timer as usual. With `sensor_type: event`, EC goes to `active` whenever a light is still on.
 - Switching every light off ends the block in `idle`, with the same turn-off as at the expiry. An override, `constrain` or a forced sensor ends it as before, without the turn-off of both modes' targets: after an override, a turn-off (its own `on_enter_overridden`, or the later one in `idle`) targets the set of the last activation.
 
-Hold sensors keep any block alive (also with `block_on_external_on: false`): a hold sensor that turns on in `blocked` restarts the block timer with `block_timeout`, at most once a minute, and only within `hold_max_seconds` of the block start or the last regular-sensor onset (which re-enters `blocked`, as before; `hold_max_seconds: null`: no bound). The restart neither leaves nor re-enters `blocked`, saves nothing and switches nothing; `expires_at` and `notes` show it.
+Hold sensors keep any block alive (also with `block_on_external_on: false`): a hold sensor that turns on in `blocked` restarts the block timer with `block_timeout` (cut to what `block_max_seconds` leaves), at most once a minute, and only within `hold_max_seconds` of the block start or the last regular-sensor onset (which re-enters `blocked`, as before; `hold_max_seconds: null`: no bound). The restart neither leaves nor re-enters `blocked`, saves nothing and switches nothing; `expires_at` and `notes` show it.
 
 After a restart, a light switched on while a restored timer waits for its lights ends the wait in `blocked` too (see State Persistence).
 
@@ -257,5 +268,57 @@ Known limits:
 - An automation that EC triggered counts as external.
 - A light left on deliberately in an empty room goes off when the block ends; set `block_on_external_on: false` on such an instance.
 - A block that ends by adoption (a sensor on at the expiry) hands the lights to the current mode's set, and one that an override ends (for example a disable switch toggled at startup) leaves them with the set of the last activation: when EC later goes `idle`, a lamp switched on by hand that is not in that set stays on until the next motion onset (only with `night_mode: entities`).
-- A restart restarts `block_timeout` and the `hold_max_seconds` bound for hold sensors, and keeps the block only if a light reports on when the state is restored. A relay that is still `unavailable` then falls back to the normal start and its comeback resync.
+- A restart restarts `block_timeout` (within `block_max_seconds`, which keeps counting) and the `hold_max_seconds` bound for hold sensors, and keeps the block only if a light reports on when the state is restored. A relay that is still `unavailable` then falls back to the normal start and its comeback resync.
 - A block ended by switching the light off still sends the usual `on_enter_idle` turn-off.
+
+## Block Cap (`block_max_seconds`)
+
+**Problem:** Every motion onset in `blocked` re-enters `blocked` and restarts the block timer with a full `block_timeout`. Where onsets keep coming (outdoors, a hallway), the block ends only once `block_timeout` passes without one (2026-11-17: with `block_timeout: 1800`, three onsets kept ec_108f blocked for 52 minutes, until the lights were switched off by hand).
+
+**Solution:** `block_max_seconds` limits how long one block may last, counted from the moment EC first entered `blocked`. Unset (the default), nothing changes.
+
+```yaml
+entity_controller:
+  pergola:
+    sensor: binary_sensor.pergola_motion
+    entity: light.pergola
+    block_timeout: 1800
+    block_max_seconds: 3600   # a block ends at most one hour after it began
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `block_max_seconds` | number (seconds, 1-604800) | `null` (no cap) | Longest a block may last, counted from its first entry. A boolean, a non-number, NaN or a value outside 1-604800 logs an error and sets no cap. Shown as the `block_max_seconds` attribute when set. |
+
+- Every block timer EC starts is cut to what the cap leaves: the first one, the one a motion onset starts when it re-enters `blocked`, and a hold-sensor restart. `expires_at` shows the real end.
+- The block ends at most 1 second after the cap, once. When the cap has elapsed, sensor and hold-sensor edges no longer restart the block timer.
+- At the cap the usual block-expiry rules apply, unchanged (see "How the block ends" under Block on External ON). With `sensor_type: duration`: every sensor off, EC goes to `idle` and switches the lights off; a sensor or hold sensor on, EC goes to `active` and switches on every control entity of the current mode, also one switched off by hand.
+- Without `block_timeout`, the cap alone times the block (a hold sensor then restarts nothing, as before).
+- Each block has its own count. A block entered from another state (from `idle`, after an activation, an override or `constrained`) starts a new one; only the re-entry by a motion onset keeps the first entry.
+- After a restart the count continues: the first entry is saved with the `blocked` state, and the restored block timer is cut to what is left, but to no less than one `delay` (the night delay at night), so a block whose cap ran out while Home Assistant was down does not end the moment it is restored. A state file written before 9.13.0 has no saved entry; the count then starts at the restore.
+- The count uses wall-clock time so that it survives a restart. A clock step back can lengthen one block by that step; a step forward shortens it.
+
+## Switch Off on Stop (`turn_off_on_stop`)
+
+**Problem:** When Home Assistant stops while EC's timer runs, the lights EC switched on stay on for as long as Home Assistant is down: the timer is saved and resumed at the next start, but nothing switches the lights off in between (2026-11-17: the host was shut down at 15:56 with ec_108f in `active_timer`, and the pergola lights stayed on for 3 h 41 min).
+
+**Solution:** With `turn_off_on_stop: true`, EC ends a running activation when Home Assistant stops cleanly. It does so in a shutdown job, which Home Assistant runs before the `homeassistant_stop` event, while the integrations are still connected.
+
+```yaml
+entity_controller:
+  pergola:
+    sensor: binary_sensor.pergola_motion
+    entity: light.pergola
+    turn_off_on_stop: true
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `turn_off_on_stop` | boolean | `false` | Switch the control entities off when Home Assistant stops while EC is `active`, `active_timer` or `active_stay_on`. Only a YAML `true`/`false` is accepted; anything else logs an error and uses `false`. The value is always shown as the `turn_off_on_stop` attribute. |
+
+- Only a running activation is ended (`active`, `active_timer`, `active_stay_on`). In `pending` (but see the restored timer below), `idle`, `blocked`, `overridden` and `constrained` nothing is switched: a light switched on by hand is not EC's to switch off. The state alone decides. Lights EC adopted earlier (a block that ended with a sensor on, a forced sensor) count as EC's; in a block, the lights EC had switched on before it began stay on too.
+- The order: EC starts the turn-off calls (the usual turn-off pass, `trigger_on_deactivate` included), goes `idle`, saves `idle`, then waits up to 5 seconds (counted from the calls) for them to finish and 3 more seconds for automations that mirror a control entity. A save that fails does not stop the turn-off. A call without confirmation is logged (WARNING) and named in the `notes` attribute. A light that is `unavailable` at that moment is not named: Home Assistant skips it without an error.
+- From then until the process exits, EC ignores its sensors, hold sensors, forced sensors and event sensors and switches nothing on, in every state. Turn-offs still go out: a light that returns `on` from `unavailable` while EC is `idle` is switched off, also with a sensor on (before the stop job such a light is adopted instead). A restored timer that still waits for its lights after a start (see State Persistence) does not resume: when one of its lights returns on, EC switches the lights off and saves `idle`, unless an override is on or a light was switched on during the wait (those are left alone, as at any restore). Without such a return the wait goes on and the stop saves the timer, as on any stop during the wait.
+- A restart darkens a room EC has lit, also with people in it. After the restart EC starts in `idle`. The light comes back at the next sensor ON edge; a sensor that is already on at the start does not switch it on.
+- It needs a clean stop. A crash, a kill or a power cut runs no shutdown job. Neither does a stop before Home Assistant has finished starting: it handles the stop signal only once `homeassistant_started` has fired, and until then a stop signal (systemd, `kill`) ends the process at once, without a shutdown job and without a save. EC is already switching lights by then (70 seconds after its setup), so lights it switched on in that time stay on through such a stop. After a cold boot the start-up can take minutes (2026-11-17: 9 minutes from the process start to `homeassistant_started`). A stop before EC has registered its handlers, 70 seconds after its setup, is not covered either. Home Assistant gives all shutdown jobs 20 seconds together; EC's takes at most 8.
+- It needs a Home Assistant core that has shutdown jobs (`hass.async_add_shutdown_job`).

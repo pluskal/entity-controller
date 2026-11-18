@@ -37,7 +37,7 @@ from typing import Optional, List
 import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
 from homeassistant.const import CONF_NAME, SUN_EVENT_SUNRISE, SUN_EVENT_SUNSET
-from homeassistant.core import callback, Context
+from homeassistant.core import callback, Context, HassJob
 from homeassistant.helpers import entity, event, service
 from homeassistant.helpers.template import Template
 from homeassistant.helpers.entity_component import EntityComponent
@@ -98,6 +98,8 @@ from .const import (
     CONF_BLOCK_TIMEOUT,
     CONF_DISABLE_BLOCK,
     CONF_BLOCK_ON_EXTERNAL_ON,
+    CONF_BLOCK_MAX_SECONDS,
+    CONF_TURN_OFF_ON_STOP,
     CONF_SENSOR_TYPE_DURATION,
     CONF_SENSOR_TYPE,
     CONF_SENSOR_RESETS_TIMER,
@@ -153,6 +155,12 @@ RESTORE_WAIT_SECONDS = 300
 # (2026-11-10; the 103 radar flips about 54 times a day).
 HOLD_REARM_THROTTLE = 60
 
+# turn_off_on_stop: longest wait for the turn-off calls, then a pause so an
+# automation that mirrors a control entity can send its own command before
+# homeassistant_stop cancels it.
+STOP_TURN_OFF_TIMEOUT = 5
+STOP_SETTLE_SECONDS = 3
+
 devices = []
 MODE_SCHEMA = vol.Schema(
     vol.All(
@@ -205,6 +213,8 @@ ENTITY_SCHEMA = vol.Schema(
         vol.Optional(CONF_DISABLE_BLOCK, default=False): cv.boolean,
         # documentation only; runtime accepts a real bool (config_other)
         vol.Optional(CONF_BLOCK_ON_EXTERNAL_ON, default=True): cv.boolean,
+        vol.Optional(CONF_BLOCK_MAX_SECONDS, default=None): vol.Any(None, vol.Coerce(float)),
+        vol.Optional(CONF_TURN_OFF_ON_STOP, default=False): cv.boolean,
         vol.Optional(CONF_IGNORE_STATE_CHANGES_UNTIL, default=None): vol.Any(None, cv.positive_int),
         vol.Optional(CONF_NIGHT_MODE, default=None): MODE_SCHEMA,
         vol.Optional(CONF_STATE_ATTRIBUTES_IGNORE, default=[]): cv.ensure_list,
@@ -321,7 +331,8 @@ async def async_setup(hass, config):
     # Blocked
     machine.add_transition(trigger="enable", source="blocked", dest="idle", conditions=["is_state_entities_off"])
     machine.add_transition(
-        trigger="sensor_on", source="blocked", dest="blocked", conditions=["is_block_enabled"]
+        trigger="sensor_on", source="blocked", dest="blocked",
+        conditions=["is_block_enabled"], unless=["is_block_cap_reached"]
     )  # re-entering self-transition (on_enter callback executed.)
 
     # Overridden
@@ -589,6 +600,8 @@ class EntityController(entity.Entity):
             "lux_threshold",
             "lux_bright_states",
             "block_on_external_on",
+            "block_max_seconds",
+            "turn_off_on_stop",
         ]
         for k, v in self.attributes.items():
             if k in PERSISTED_STATE_ATTRIBUTES:
@@ -702,6 +715,11 @@ class Model:
         # of the block start / last regular-sensor entry and of the block timer
         self._block_ending = False
         self._block_anchor = self._block_timer_started = 0.0
+        self.block_max_seconds = None
+        self._block_started_at = None  # UTC, first entry into the current block
+        self.turn_off_on_stop = False
+        self._stopping = False  # set by the shutdown job: nothing is switched on any more
+        self._stop_calls = None  # list while the shutdown job collects its turn-off calls
         self.night_mode_entity = None
         self.night_mode_entity_states = []
         self.nightControlEntities = []
@@ -752,7 +770,7 @@ class Model:
 
         # Phase 2: Set up state persistence store and register shutdown handler
         self._store = Store(self.hass, STORAGE_VERSION, self._storage_key())
-        self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self._async_save_state)
+        self._register_stop_handlers()
 
         # Phase 2: Attempt to restore persisted state before the first transition
         restored = await self._async_restore_state()
@@ -763,6 +781,50 @@ class Model:
                 self.update(overridden_at=str(datetime.now()))
             else:
                 self.start_monitoring()
+
+    def _register_stop_handlers(self):
+        self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self._async_save_state)
+        if self.turn_off_on_stop:
+            self.hass.async_add_shutdown_job(
+                HassJob(self._async_turn_off_on_stop, "entity_controller %s turn_off_on_stop" % self.name))
+
+    async def _async_turn_off_on_stop(self, *_args):
+        """Shutdown job: a running activation ends before the integrations
+        disconnect; from here on EC switches nothing on and ignores its sensors."""
+        self._stopping = True
+        if self.state not in ("active", "active_timer", "active_stay_on"):
+            return
+        was = self.state
+        self.set_context(None)
+        self._stop_calls = calls = []
+        try:
+            self.turn_off_control_entities()
+            self.to_idle()
+        finally:
+            # In flight before anything is awaited: a failing transition or
+            # save cannot stop the turn-off.
+            self._stop_calls = None
+            tasks = {asyncio.ensure_future(coro): entity for entity, coro in calls}
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + STOP_TURN_OFF_TIMEOUT
+        notes = "Home Assistant is stopping: lights switched off (was %s)" % was
+        self.update(notes=notes)
+        try:
+            await asyncio.wait_for(self._async_save_state(), STOP_TURN_OFF_TIMEOUT)
+        except Exception as err:
+            self.log.warning("turn_off_on_stop :: state not saved: %r", err)
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(tasks, timeout=max(deadline - loop.time(), 0))
+        for task in pending:
+            task.cancel()
+        failed = sorted({tasks[t] for t in pending}
+                        | {tasks[t] for t in done if not t.cancelled() and t.exception()})
+        if failed:
+            # also in notes: a logger default of error hides the WARNING
+            self.log.warning("turn_off_on_stop :: no confirmation from %s", ", ".join(failed))
+            self.update(notes="%s; no confirmation from %s" % (notes, ", ".join(failed)))
+        await asyncio.sleep(STOP_SETTLE_SECONDS)
 
     def update(self, wait=False, **kwargs):
         """ Called from different methods to report a state attribute change """
@@ -787,6 +849,8 @@ class Model:
     @callback
     def sensor_state_change(self, event):
         """ State change callback for sensor entities """
+        if self._stopping:
+            return
         entity = event.data["entity_id"]
         old = event.data["old_state"]
         new = event.data["new_state"]
@@ -895,6 +959,8 @@ class Model:
     @callback
     def hold_sensor_state_change(self, event):
         """Hold sensor: keeps the light on, but never switches it on."""
+        if self._stopping:
+            return
         entity = event.data["entity_id"]
         old = event.data["old_state"]
         new = event.data["new_state"]
@@ -945,8 +1011,9 @@ class Model:
         """A hold sensor keeps a block alive (2026-11-10): the block timer
         restarts in place, at most once per HOLD_REARM_THROTTLE seconds and
         within hold_max_seconds of the block start or the last regular-sensor
-        edge; never a re-entry of blocked."""
-        if not self.block_timeout:
+        edge; never a re-entry of blocked. Not once block_max_seconds has
+        elapsed."""
+        if not self.block_timeout or self.is_block_cap_reached():
             return
         now, cap = self.hass.loop.time(), getattr(self, "hold_max_seconds", None)
         if cap and now - self._block_anchor >= cap:
@@ -1072,6 +1139,13 @@ class Model:
                     self.turn_on_control_entities()
                 return
             if is_on and self.is_idle():
+                if self._stopping:
+                    # After the turn_off_on_stop job nothing is adopted, also
+                    # with a sensor on: the adopted light would stay on
+                    # through the downtime.
+                    self.log.info("resync :: on while Home Assistant is stopping — turning it off")
+                    self.turn_off_control_entities()
+                    return
                 if self.is_sensor_on():
                     # Someone is in the room and the light is on. Leaving EC in
                     # 'idle' is NOT enough: the next sensor edge would call
@@ -1122,6 +1196,9 @@ class Model:
             self.log.debug("state_entity_state_change :: cannot compare the two states, handling the change: %s", a)
         if self._debounce_state_change(entity, old, new, attr_only):
             return
+        if self.is_active_timer() and self._partial_off([(old, new)]):
+            self._keep_timer([entity])
+            return
         self.set_context(new.context)
         if self.is_idle():
             # acts only with the debounce off; with it on, an ON edge went into the window
@@ -1134,6 +1211,31 @@ class Model:
 
         if self.is_blocked() or self.is_active_stay_on(): # if statement required to avoid MachineErrors, cleaner than adding transitions to all possible states.
             self.enable()
+
+    def _partial_off(self, changes):
+        """changes: (state before, state now) pairs. True when each is a state
+        entity that was on and is not on any more, and every state entity still
+        on is one the timer's turn-off will switch (2026-11-17: light.108_i
+        reported off mid-timer and ec_108f stayed blocked for 52 min)."""
+        if not changes or not self.is_block_enabled():
+            return False
+        for old, cur in changes:
+            if old is None or cur is None or not self.matches(old.state, self.STATE_ON_STATE) \
+                    or self.matches(cur.state, self.STATE_ON_STATE):
+                return False
+        targets = self.activeControlEntities or self.controlEntities
+        still_on = [e for e in self.stateEntities if self._is_state_on(e)]
+        return bool(still_on) and all(e in targets for e in still_on)
+
+    def _is_state_on(self, entity):
+        s = self.hass.states.get(entity)
+        return s is not None and self.matches(s.state, self.STATE_ON_STATE)
+
+    def _keep_timer(self, entities):
+        names = ", ".join(entities)
+        # no timer claim: with a sensor holding the light none is running
+        self.log.info("%s switched off outside EC while another light is on; not blocked", names)
+        self.update(notes="%s switched off outside EC while another light is on; not blocked" % names)
 
     def _significant_attributes(self, state):
         return {
@@ -1200,6 +1302,10 @@ class Model:
         if not changed:
             if back:
                 log("_state_debounce_fire :: %s is back to its previous state - ignoring the bounce (EC state: %s)", ", ".join(back), self.state)
+            return
+        if window.state == "active_timer" and self._partial_off(
+                [(window.snapshot[e][0], self._debounce_current(e, window.snapshot[e][2])) for e in changed]):
+            self._keep_timer(changed)
             return
         if window.state != "idle":
             self.log.info("_state_debounce_fire :: %s changed for good - handling it (EC state: %s)", ", ".join(changed), self.state)
@@ -1271,6 +1377,8 @@ class Model:
         Forced sensors bypass blocked, constrained, and overridden states and
         immediately activate the controller.
         """
+        if self._stopping:
+            return
         entity_id = ev.data["entity_id"]
         old = ev.data["old_state"]
         new = ev.data["new_state"]
@@ -1303,6 +1411,8 @@ class Model:
         Subscribes to arbitrary HA bus events and triggers sensor_on when
         the configured event fires, regardless of any attached event data.
         """
+        if self._stopping:
+            return
         self.log.debug(
             "ha_event_sensor_callback :: Received HA bus event '%s' (state=%s)",
             event_type,
@@ -1339,8 +1449,11 @@ class Model:
 
         # not able to use async_call_later because no known way to check whether timer is active.
         # self.timer_handle = event.async_call_later(self.hass, self.previous_delay, self.timer_expire)
-        self.timer_handle = Timer(delay, self.timer_expire)
-        self.timer_handle.start()
+        # daemon: a pending timer must not hold the process at exit
+        handle = Timer(delay, self.timer_expire)
+        handle.daemon = True
+        self.timer_handle = handle
+        handle.start()
         self._expiry_time = expiry_time
         self.update(expires_at=expiry_time)
 
@@ -1511,6 +1624,12 @@ class Model:
     def is_block_enabled(self):
         return self.disable_block is False
 
+    def is_block_cap_reached(self):
+        """block_max_seconds has elapsed: nothing restarts the block timer any
+        more, the pending one ends the block."""
+        cap, since = self.block_max_seconds, self._block_started_at
+        return bool(cap and since) and (dt_util.utcnow() - since).total_seconds() >= cap
+
     def is_lux_constraint_satisfied(self):
         """Whether the illuminance constraint allows turning the lights on.
 
@@ -1656,7 +1775,8 @@ class Model:
         self._debounce_window = None
         # Entering idle due to no events, set a new context with no parent
         self.set_context(None)
-        if not quiet:
+        # not while the shutdown job collects: it already made the turn-off pass
+        if not quiet and self._stop_calls is None:
             self.do_transition_behaviour(CONF_ON_ENTER_IDLE)
         self.entity.reset_state()
 
@@ -1707,28 +1827,43 @@ class Model:
     def on_exit_active_stay_on(self):
         self._debounce_window = None
 
-    def on_enter_blocked(self):
+    def on_enter_blocked(self, since=None):
+        """since: saved first entry of a restored block (restore_blocked)."""
         self.log.debug("Entering blocked")
+        # A re-entry (sensor_on in blocked) keeps the first entry.
+        if since is not None or not self._block_ending or self._block_started_at is None:
+            self._block_started_at = since or dt_util.utcnow()
         self.update(blocked_at=datetime.now())
         self.update(blocked_by=self._state_entity_state())
 
         self.do_transition_behaviour(CONF_ON_ENTER_BLOCKED)
         self._block_anchor = self.hass.loop.time()
-        if self.block_timeout:
+        if self.block_timeout or self.block_max_seconds:
             self._start_block_timer()
         self._schedule_save_state()
+
+    def _block_seconds(self):
+        """block_timeout, cut to what block_max_seconds leaves (at least 1 s)."""
+        seconds, cap = self.block_timeout, self.block_max_seconds
+        if cap:
+            elapsed = (dt_util.utcnow() - (self._block_started_at or dt_util.utcnow())).total_seconds()
+            left = max(cap - max(elapsed, 0), 1.0)
+            seconds = left if not seconds else min(seconds, left)
+        return seconds
 
     def _start_block_timer(self):
         # Locals only: the expiring timer's worker may clear the handle
         # (on_exit_blocked) at any point in between.
-        old, new = self.block_timer_handle, Timer(self.block_timeout, self.block_timer_expire)
+        seconds = self._block_seconds()
+        old, new = self.block_timer_handle, Timer(seconds, self.block_timer_expire)
         if old is not None:
             old.cancel()
         self.block_timer_handle = new
         self._block_timer_started = self.hass.loop.time()
+        new.daemon = True
         new.start()
         self.update(block_timeout=self.block_timeout,
-                    expires_at=datetime.now() + timedelta(seconds=self.block_timeout))
+                    expires_at=datetime.now() + timedelta(seconds=seconds))
 
     def on_exit_blocked(self):
         self.log.debug("Exiting blocked")
@@ -2161,6 +2296,25 @@ class Model:
         self.update(block_on_external_on=external_on)
         if not external_on:
             self.log.info("block_on_external_on is false: a light switched on outside EC while idle is left as it is")
+        raw, cap = config.get(CONF_BLOCK_MAX_SECONDS), None
+        if raw is not None:
+            try:
+                if isinstance(raw, bool):
+                    raise ValueError(raw)
+                cap = float(raw)
+                if not 1 <= cap <= 604800:
+                    raise ValueError(raw)
+            except (TypeError, ValueError, OverflowError):
+                self.log.error("block_max_seconds must be 1-604800 seconds or null, got %r; no cap", raw)
+                cap = None
+        self.block_max_seconds = cap
+        self.update(block_max_seconds=cap)  # update() skips None: no attribute without a cap
+        stop_off = config.get(CONF_TURN_OFF_ON_STOP, False)
+        if not isinstance(stop_off, bool):
+            self.log.error("turn_off_on_stop must be true or false, got %r; using false", stop_off)
+            stop_off = False
+        self.turn_off_on_stop = stop_off
+        self.update(turn_off_on_stop=stop_off)
         self.image_prefix = config.get("image_prefix", "/fsm_diagram_")
         self.image_path = config.get("image_path", "/conf/temp")
         self.backoff = config.get("backoff", False)
@@ -2223,6 +2377,10 @@ class Model:
             # restarts the light stayed on 21 times, with a 20-40 min tail
             # after the last motion).
             "expires_at": str(expiry) if expiry else None,
+            # First entry into the block (UTC), so block_max_seconds keeps
+            # counting across a restart.
+            "blocked_since": self._block_started_at.isoformat()
+                             if state == "blocked" and self._block_started_at else None,
         }
         self.log.debug("_async_save_state :: Saving state: %s", data)
         await self._store.async_save(data)
@@ -2277,7 +2435,7 @@ class Model:
                 return False  # the caller enters overridden, as on a normal start
             if self.is_state_entities_on() and self.is_block_enabled():
                 self.set_context(None)
-                self.restore_blocked()
+                self.restore_blocked(since=self._restored_block_start(data.get("blocked_since")))
                 return True
             return False
 
@@ -2296,6 +2454,22 @@ class Model:
         # For all other states (idle, constrained, etc.) let the normal startup
         # evaluation run.
         return False
+
+    def _restored_block_start(self, raw):
+        """Saved first entry of a restored block, moved so that one delay is
+        left; None (no cap, a 9.12.0 file, unreadable): the block starts now."""
+        cap = self.block_max_seconds
+        if not cap or not raw:
+            return None
+        try:
+            since = datetime.fromisoformat(str(raw))
+        except ValueError:
+            return None
+        if since.tzinfo is None:
+            return None
+        now = dt_util.utcnow()
+        floor = now - timedelta(seconds=max(cap - self._restore_delays()[0], 0))
+        return min(max(since, floor), now)
 
     def _restore_timer(self, expiry, settled=False):
         """Settle a saved active_timer from the live states (EC in pending).
@@ -2354,15 +2528,26 @@ class Model:
         sensor_on, sensor_unknown = self._restore_sensor_knowledge()
         delay, cap = self._restore_delays()
         remaining = (expiry - datetime.now()).total_seconds()
-        if remaining <= 1 and not (sensor_on or sensor_unknown):
+        stopping = self._stopping
+        if stopping or (remaining <= 1 and not (sensor_on or sensor_unknown)):
             # Ran out while HA was down and every sensor reports off: one
-            # turn-off, whatever on_enter_idle says.
-            self.log.info(
-                "_restore_timer :: timer ran out while HA was down (%s) and no sensor "
-                "holds the light, turning control entities off", expiry)
+            # turn-off, whatever on_enter_idle says. Also when a light returns
+            # after the turn_off_on_stop job: off before the integrations
+            # disconnect, instead of on through the downtime.
+            if stopping:
+                self.log.info("_restore_timer :: Home Assistant is stopping, turning the lights "
+                              "from before the restart off")
+            else:
+                self.log.info(
+                    "_restore_timer :: timer ran out while HA was down (%s) and no sensor "
+                    "holds the light, turning control entities off", expiry)
             self.start_monitoring(quiet=True)
             self.turn_off_control_entities()
-            self.update(notes="Timer ran out while HA was down and no sensor holds the light — entities turned off")
+            if stopping:
+                self.update(notes="Home Assistant is stopping: lights from before the restart switched off")
+                self._schedule_save_state()
+            else:
+                self.update(notes="Timer ran out while HA was down and no sensor holds the light — entities turned off")
             return True
         if remaining <= 1:
             # A sensor holds the light, or has not reported yet (Zigbee2MQTT
@@ -2468,7 +2653,9 @@ class Model:
 
     @callback
     def _restore_wait_event(self, wait, ev):
-        """A light or override entity changed while a restored timer waits."""
+        """A light or override entity changed while a restored timer waits.
+        After the turn_off_on_stop job a comeback still counts: _restore_timer
+        then switches the lights off."""
         if self._restore_wait is not wait or self.hass.is_stopping:
             return
         entity = ev.data["entity_id"]
@@ -2497,7 +2684,7 @@ class Model:
     @callback
     def _restore_wait_timeout(self, wait, _now=None):
         """The lights of a restored timer did not report in time."""
-        if self._restore_wait is not wait or self.hass.is_stopping or not self.is_pending():
+        if self._restore_wait is not wait or self.hass.is_stopping or self._stopping or not self.is_pending():
             return
         self.log.warning(
             "_restore_wait_timeout :: lights still not reachable after %d s; ending the wait "
@@ -2520,7 +2707,7 @@ class Model:
     @callback
     def _restore_wait_settled(self, wait, _now=None):
         """The lights stayed off for state_change_debounce after coming back."""
-        if self._restore_wait is not wait or self.hass.is_stopping or not self.is_pending():
+        if self._restore_wait is not wait or self.hass.is_stopping or self._stopping or not self.is_pending():
             return
         wait.settle = None
         self._restore_timer(wait.expiry, settled=True)
@@ -2725,6 +2912,9 @@ class Model:
                     self.call_service(e, "turn_on")
 
     def turn_on_control_entities(self):
+        if self._stopping:
+            self.log.debug("turn_on_control_entities :: Home Assistant is stopping, nothing is switched on")
+            return
         self.handleTriggerOnActivateEntities()
 
         for e in self.activeControlEntities or self.controlEntities:
@@ -3010,10 +3200,15 @@ class Model:
             params = service_data
 
         params["entity_id"] = entity
-        asyncio.run_coroutine_threadsafe(
-            self.hass.services.async_call(domain, service, service_data, context=self.context),
-            self.hass.loop
-        )
+        if self._stop_calls is not None:
+            # the shutdown job starts and awaits these itself
+            self._stop_calls.append((entity, self.hass.services.async_call(
+                domain, service, service_data, blocking=True, context=self.context)))
+        else:
+            asyncio.run_coroutine_threadsafe(
+                self.hass.services.async_call(domain, service, service_data, context=self.context),
+                self.hass.loop
+            )
         self.update(service_data=service_data)
 
     def set_context(self, parent: Optional[Context] = None) -> None:
