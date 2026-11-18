@@ -1139,6 +1139,13 @@ class Model:
                     self.turn_on_control_entities()
                 return
             if is_on and self.is_idle():
+                if self._stopping:
+                    # After the turn_off_on_stop job nothing is adopted, also
+                    # with a sensor on: the adopted light would stay on
+                    # through the downtime.
+                    self.log.info("resync :: on while Home Assistant is stopping — turning it off")
+                    self.turn_off_control_entities()
+                    return
                 if self.is_sensor_on():
                     # Someone is in the room and the light is on. Leaving EC in
                     # 'idle' is NOT enough: the next sensor edge would call

@@ -5172,21 +5172,31 @@ class TestTurnOffOnStop:
         assert model.state == "active_timer"
         model.hass.services.async_call.assert_not_called()
 
-    def test_after_the_stop_job_a_light_returning_on_is_still_switched_off(self):
+    @pytest.mark.parametrize("sensor", ["quiet", "motion", "hold"])
+    def test_after_the_stop_job_a_light_returning_on_is_still_switched_off(self, sensor):
         """The latch stops turn-ons only: light.108_f missed the job's
-        turn-off and returns on before the process exits."""
+        turn-off (unavailable) and returns on before the process exits. It is
+        switched off also with a sensor or hold sensor on; without the latch
+        EC would adopt it (force_activate), and the light would stay on
+        through the downtime with active_timer saved."""
         model = self._model()
         self.live[self.F] = "unavailable"
         self._stop(model)
         self.live.update({self.F: "on", self.I: "off", self.PROXY: "off"})
+        if sensor != "quiet":
+            self.live[self.PIR if sensor == "motion" else self.RADAR] = "on"
         model.hass.services.async_call.reset_mock()
-        with self._no_save():
+        with patch(self.TIMER) as timer, self._no_save():
             model.state_entity_state_change(self._event(self.F, "unavailable", "on"))
         assert model.state == "idle"
+        timer.assert_not_called()
+        model._start_timer.assert_not_called()
         calls = model.hass.services.async_call.call_args_list
         assert [(c.args[1], c.args[2]["entity_id"]) for c in calls] == [
             ("turn_off", e) for e in self.ENTITIES]
         assert all("blocking" not in c.kwargs for c in calls)
+        asyncio.run(model._async_save_state())
+        assert model._store.async_save.call_args[0][0]["state"] == "idle"
 
     # -- the option -------------------------------------------------------------
 
