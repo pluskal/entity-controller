@@ -290,6 +290,7 @@ async def async_setup(hass, config):
         trigger="override",
         source=["pending", "idle", "active_timer", "blocked"],
         dest="overridden",
+        before="_remember_override_lit",
     )
 
     machine.add_transition(
@@ -349,12 +350,14 @@ async def async_setup(hass, config):
         source="overridden",
         dest="active",
         conditions=["is_state_entities_on", "is_event_sensor"],
+        before="_carry_override_lit",
     )
     machine.add_transition(
         trigger="enable",
         source="overridden",
         dest="active",
         conditions=["is_state_entities_on", "is_sensor_on"],
+        before="_carry_override_lit",
     )  # This could be duration && on, but it will also work for any event sensor, so it's simpler to just write 'on'
     machine.add_transition(
         trigger="enable",
@@ -1784,6 +1787,18 @@ class Model:
         self.log.debug("Exiting idle")
         self.do_transition_behaviour(CONF_ON_EXIT_IDLE)
 
+    # 2026-11-22: the set EC lit before an override is carried into the
+    # active state that follows it. on_enter_active re-chooses the day/night
+    # set, so without this a light of the other mode stayed on (ec_205: the
+    # wardrobe lit by day, the bed light chosen at night after the TV ended).
+    def _remember_override_lit(self):
+        lit = self.state in ("active", "active_timer")
+        self._override_lit = list(self.activeControlEntities or self.controlEntities) if lit else []
+
+    def _carry_override_lit(self):
+        self._carry_lit = getattr(self, "_override_lit", None) or []
+        self._override_lit = []
+
     def on_enter_overridden(self):
         self.log.debug("Entering overridden")
         self.do_transition_behaviour(CONF_ON_ENTER_OVERRIDDEN)
@@ -1807,6 +1822,14 @@ class Model:
         self.log.debug("on_enter_active :: light params before turning on: " + str(self.lightParams))
         if resume is None:
             self.do_transition_behaviour(CONF_ON_ENTER_ACTIVE)
+        # after the turn-on: a carried light keeps its own mode's brightness
+        carry = [e for e in (getattr(self, "_carry_lit", None) or [])
+                 if e not in self.activeControlEntities and self._is_control_on(e)]
+        self._carry_lit = []
+        if carry:
+            self.log.info("on_enter_active :: keeping %s lit before the override in the off set", carry)
+            self.activeControlEntities = list(self.activeControlEntities) + carry
+            self.update(active_entities=list(self.activeControlEntities))
         self.enter()
 
     def on_exit_active(self):

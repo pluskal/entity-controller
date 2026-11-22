@@ -54,6 +54,7 @@ def _add_machine_transitions(machine):
         trigger="override",
         source=["pending", "idle", "active_timer", "blocked"],
         dest="overridden",
+        before="_remember_override_lit",
     )
     machine.add_transition(trigger="activate", source=["idle", "blocked"], dest="active")
     machine.add_transition(
@@ -91,10 +92,12 @@ def _add_machine_transitions(machine):
     machine.add_transition(
         trigger="enable", source="overridden", dest="active",
         conditions=["is_state_entities_on", "is_event_sensor"],
+        before="_carry_override_lit",
     )
     machine.add_transition(
         trigger="enable", source="overridden", dest="active",
         conditions=["is_state_entities_on", "is_sensor_on"],
+        before="_carry_override_lit",
     )
     machine.add_transition(
         trigger="enable", source="overridden", dest="idle",
@@ -2580,6 +2583,114 @@ class TestNightModeEntity:
 
 
 # ---------------------------------------------------------------------------
+# 2026-11-22 – night_mode set re-chosen after an override (ec_205 orphan)
+# ---------------------------------------------------------------------------
+
+class TestNightModeAcrossOverride:
+    """Day set lit, override, house mode turns night, override ends: the
+    timer's turn-off must still cover the light EC lit by day."""
+
+    DAY, NIGHT, TV, MODE = "light.wardrobe", "light.bed", "binary_sensor.tv", "input_select.house_mode"
+
+    def _model(self):
+        model = _build_model()
+        model.controlEntities = [self.DAY]
+        model.stateEntities = [self.DAY, self.NIGHT]
+        model.overrideEntities = [self.TV]
+        model.night_mode = {"delay": 120}
+        model.night_mode_entity = self.MODE
+        model.night_mode_entity_states = ["vecerka", "noc"]
+        model.nightControlEntities = [self.NIGHT]
+        model.light_params_night = {"delay": 120, "service_data": None, "service_data_off": None}
+        model.update = MagicMock()
+        self.live = {self.MODE: "den", self.DAY: "off", self.NIGHT: "off", self.TV: "off"}
+
+        def get(entity):
+            if entity not in self.live:
+                return None
+            s = MagicMock()
+            s.state = self.live[entity]
+            return s
+        model.hass.states.get = MagicMock(side_effect=get)
+
+        def call_service(entity, service, **kw):
+            self.live[entity] = "on" if service == "turn_on" else "off"
+        model.call_service = MagicMock(side_effect=call_service)
+        return model
+
+    def _offs(self, model):
+        return [c.args[0] for c in model.call_service.call_args_list if c.args[1] == "turn_off"]
+
+    def _override_then_night(self, model):
+        self.live[self.TV] = "on"
+        model.override()
+        assert model.state == "overridden"
+        self.live[self.MODE] = "noc"
+        self.live[self.TV] = "off"
+
+    def test_timer_off_after_override_turns_off_day_light(self):
+        model = self._model()
+        model.sensor_on()
+        assert model.state == "active_timer" and self.live[self.DAY] == "on"
+        self._override_then_night(model)
+        model.call_service.reset_mock()
+        model.enable()
+        assert model.state == "active_timer"
+        # no night brightness pushed onto the carried light; only the night set turned on
+        assert [c.args[0] for c in model.call_service.call_args_list if c.args[1] == "turn_on"] == [self.NIGHT]
+        model.timer_expires()
+        assert model.state == "idle"
+        assert sorted(self._offs(model)) == sorted([self.NIGHT, self.DAY])
+        assert self.live[self.DAY] == "off"
+
+    def test_carry_is_consumed_once(self):
+        model = self._model()
+        model.sensor_on()
+        self._override_then_night(model)
+        model.enable()
+        model.timer_expires()
+        model.call_service.reset_mock()
+        model.sensor_on()  # next night activation: night set only
+        model.timer_expires()
+        assert self._offs(model) == [self.NIGHT]
+
+    def test_override_from_idle_carries_nothing(self):
+        """EC lit nothing: a day light switched on by hand during the override
+        is not added to the off set."""
+        model = self._model()
+        self.live[self.TV] = "on"
+        model.override()
+        self.live[self.DAY] = "on"  # by hand
+        self.live[self.MODE] = "noc"
+        self.live[self.TV] = "off"
+        model.enable()
+        assert model.state == "active_timer"
+        model.call_service.reset_mock()
+        model.timer_expires()
+        assert self._offs(model) == [self.NIGHT]
+
+    def test_light_switched_off_during_override_not_carried(self):
+        model = self._model()
+        model.sensor_on()
+        self._override_then_night(model)
+        self.live[self.DAY] = "off"
+        self.live[self.NIGHT] = "on"  # keeps the state entities on
+        model.enable()
+        model.call_service.reset_mock()
+        model.timer_expires()
+        assert self._offs(model) == [self.NIGHT]
+
+    def test_same_mode_no_duplicate(self):
+        model = self._model()
+        model.sensor_on()
+        self.live[self.TV] = "on"
+        model.override()
+        self.live[self.TV] = "off"
+        model.enable()
+        assert model.activeControlEntities == [self.DAY]
+
+
+# ---------------------------------------------------------------------------
 # 2026-09-19 – link outage of a controlled entity (unavailable round trip)
 # ---------------------------------------------------------------------------
 
@@ -4713,7 +4824,8 @@ class TestBlockedHoldSensors:
                 for src, transitions in ev.transitions.items():
                     for t in transitions:
                         conds = tuple(sorted((str(c.func), bool(c.target)) for c in t.conditions))
-                        rows.add((name, src, t.dest, conds, tuple(str(a) for a in t.after)))
+                        rows.add((name, src, t.dest, conds, tuple(str(a) for a in t.after),
+                                  tuple(str(b) for b in t.before)))
             return rows
 
         built = {}
@@ -4733,7 +4845,7 @@ class TestBlockedHoldSensors:
         production, copied = table(built["machine"]), table(test_copy)
         assert production - copied == set() and copied - production == set()
         assert ("sensor_on", "blocked", "blocked",
-                (("is_block_cap_reached", False), ("is_block_enabled", True)), ()) in production
+                (("is_block_cap_reached", False), ("is_block_enabled", True)), (), ()) in production
 
     def test_cap_unset_keeps_every_reentry(self):
         """No cap: ten onsets, ten new block timers, as in 9.12.0."""
