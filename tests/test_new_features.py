@@ -2680,6 +2680,22 @@ class TestNightModeAcrossOverride:
         model.timer_expires()
         assert self._offs(model) == [self.NIGHT]
 
+    def test_constrained_override_drops_stale_carry(self):
+        """Override from active_timer ends in constrained; a later
+        constrained -> overridden -> active must not carry that old set."""
+        model = self._model()
+        model.sensor_on()
+        self.live[self.TV] = "on"
+        model.override()
+        model.constrain()
+        model.enable()  # override still on -> overridden
+        assert model.state == "overridden"
+        self.live[self.MODE] = "noc"
+        self.live[self.TV] = "off"
+        model.enable()
+        assert model.state == "active_timer"
+        assert model.activeControlEntities == [self.NIGHT]
+
     def test_same_mode_no_duplicate(self):
         model = self._model()
         model.sensor_on()

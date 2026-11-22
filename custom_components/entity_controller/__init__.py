@@ -1775,6 +1775,7 @@ class Model:
         """quiet: a restore settles in idle without the on_enter_idle
         behaviour (start_monitoring(quiet=True))."""
         self.log.debug("Entering idle")
+        self._override_lit = []  # 2026-11-22: no stale carry into a later override
         self._debounce_window = None
         # Entering idle due to no events, set a new context with no parent
         self.set_context(None)
@@ -1900,6 +1901,7 @@ class Model:
 
     def on_enter_constrained(self):
         self.log.debug("Entering constrained")
+        self._override_lit = []  # 2026-11-22: constrained -> overridden does not remember a set
         self.do_transition_behaviour(CONF_ON_ENTER_CONSTRAINED)
 
     def on_exit_constrained(self):
