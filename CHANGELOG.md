@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+<a name="9.13.1"></a>
+## [9.13.1](https://github.com/pluskal/entity-controller/compare/v9.13.0...v9.13.1) (2026-11-22)
+
+
+### Bug Fixes
+
+* **night_mode** – A light EC switched on before an override is no longer orphaned when the override ends in another day/night mode. Leaving `overridden` with a light on, EC goes to `active` and re-chooses the set for the current mode; the set it had lit was dropped, so the timer switched off only the new one (2026-11-21: ec_205 lit `light.205_wardrobe` at 19:10, the TV override ran 19:11-21:33, by then night mode chose `light.205_bed`, and the wardrobe stayed on for 3 more hours). EC now remembers the set it lit when an override starts from `active`/`active_timer`; on the way back to `active` it adds the lights of that set that are still on to the new set (shown in `active_entities`), so the timer switches them off too. They are not switched on again, so they keep their own mode's brightness. An override that starts while EC lit nothing (`idle`, `blocked`, `pending`) carries nothing, a light switched off during the override is not carried, and the set is used once. Not covered: a restart during the override (the remembered set is not persisted; behaviour as before).
+
+### Tests
+
+* `TestNightModeAcrossOverride` (5): day light lit -> override -> night mode -> override ends -> timer off switches off both lights, without a turn-on of the carried light; carried set used once; override from `idle` carries nothing; light switched off during the override not carried; same mode adds nothing. The test copy of the transition table gains the `before` callbacks, and `test_production_table_matches_the_test_copy` now compares them too.
+
 <a name="9.13.0"></a>
 ## [9.13.0](https://github.com/pluskal/entity-controller/compare/v9.12.0...v9.13.0) (2026-11-17)
 
